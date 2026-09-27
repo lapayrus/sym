@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+ignore = "0.4.33"
+rayon = "1.12.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 tree-sitter = "0.27.0"
 tree-sitter-go = "0.25.0"
 tree-sitter-javascript = "0.25.0"

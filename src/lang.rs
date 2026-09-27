@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use tree_sitter_tags::{TagsConfiguration, TagsContext};
@@ -31,13 +31,19 @@ const GO_EXTRA: &str = r#"
 
 struct Lang {
     exts: &'static [&'static str],
-    cfg: TagsConfiguration,
+    language: fn() -> tree_sitter::Language,
+    queries: &'static [&'static str],
+    /// Compiled on first use: query compilation is the bulk of startup cost.
+    cfg: OnceLock<TagsConfiguration>,
 }
 
-fn lang(exts: &'static [&'static str], language: tree_sitter::Language, queries: &[&str]) -> Lang {
-    let cfg = TagsConfiguration::new(language, &queries.concat(), "")
-        .unwrap_or_else(|e| panic!("bad tags query for {exts:?}: {e}"));
-    Lang { exts, cfg }
+impl Lang {
+    fn cfg(&self) -> &TagsConfiguration {
+        self.cfg.get_or_init(|| {
+            TagsConfiguration::new((self.language)(), &self.queries.concat(), "")
+                .unwrap_or_else(|e| panic!("bad tags query for {:?}: {e}", self.exts))
+        })
+    }
 }
 
 /// Definition header: text from the def's start up to its body, whitespace collapsed.
@@ -63,19 +69,26 @@ fn signature(def: &[u8], python: bool) -> String {
     sig.chars().take(200).collect()
 }
 
-static LANGS: LazyLock<Vec<Lang>> = LazyLock::new(|| {
-    use tree_sitter_javascript as js;
-    use tree_sitter_typescript as ts;
-    vec![
-        lang(&["rs"], tree_sitter_rust::LANGUAGE.into(), &[tree_sitter_rust::TAGS_QUERY, RUST_EXTRA]),
-        lang(&["py", "pyi"], tree_sitter_python::LANGUAGE.into(), &[tree_sitter_python::TAGS_QUERY, PYTHON_EXTRA]),
-        lang(&["js", "mjs", "cjs", "jsx"], js::LANGUAGE.into(), &[js::TAGS_QUERY, JS_EXTRA]),
-        // TS tags.scm only holds TS-specific patterns; the JS ones apply on top.
-        lang(&["ts", "mts", "cts"], ts::LANGUAGE_TYPESCRIPT.into(), &[js::TAGS_QUERY, ts::TAGS_QUERY, JS_EXTRA]),
-        lang(&["tsx"], ts::LANGUAGE_TSX.into(), &[js::TAGS_QUERY, ts::TAGS_QUERY, JS_EXTRA]),
-        lang(&["go"], tree_sitter_go::LANGUAGE.into(), &[tree_sitter_go::TAGS_QUERY, GO_EXTRA]),
-    ]
-});
+use tree_sitter_javascript as js;
+use tree_sitter_typescript as ts;
+
+const fn lang(
+    exts: &'static [&'static str],
+    language: fn() -> tree_sitter::Language,
+    queries: &'static [&'static str],
+) -> Lang {
+    Lang { exts, language, queries, cfg: OnceLock::new() }
+}
+
+static LANGS: [Lang; 6] = [
+    lang(&["rs"], || tree_sitter_rust::LANGUAGE.into(), &[tree_sitter_rust::TAGS_QUERY, RUST_EXTRA]),
+    lang(&["py", "pyi"], || tree_sitter_python::LANGUAGE.into(), &[tree_sitter_python::TAGS_QUERY, PYTHON_EXTRA]),
+    lang(&["js", "mjs", "cjs", "jsx"], || js::LANGUAGE.into(), &[js::TAGS_QUERY, JS_EXTRA]),
+    // TS tags.scm only holds TS-specific patterns; the JS ones apply on top.
+    lang(&["ts", "mts", "cts"], || ts::LANGUAGE_TYPESCRIPT.into(), &[js::TAGS_QUERY, ts::TAGS_QUERY, JS_EXTRA]),
+    lang(&["tsx"], || ts::LANGUAGE_TSX.into(), &[js::TAGS_QUERY, ts::TAGS_QUERY, JS_EXTRA]),
+    lang(&["go"], || tree_sitter_go::LANGUAGE.into(), &[tree_sitter_go::TAGS_QUERY, GO_EXTRA]),
+];
 
 thread_local! {
     static CTX: RefCell<TagsContext> = RefCell::new(TagsContext::new());
@@ -109,19 +122,24 @@ fn find(path: &Path) -> Option<&'static Lang> {
     LANGS.iter().find(|l| l.exts.contains(&ext))
 }
 
+pub fn supported(path: &Path) -> bool {
+    find(path).is_some()
+}
+
 /// Extract symbols from one file. `None` if the language is unsupported.
 pub fn parse(path: &Path, src: &[u8]) -> Result<Option<Parsed>> {
     let Some(lang) = find(path) else { return Ok(None) };
+    let cfg = lang.cfg();
     let newlines: Vec<usize> = src.iter().enumerate().filter(|(_, b)| **b == b'\n').map(|(i, _)| i).collect();
     let line_of = |byte: usize| newlines.partition_point(|&nl| nl < byte) as u32 + 1;
     let text = |r: std::ops::Range<usize>| String::from_utf8_lossy(&src[r]).into_owned();
 
     let mut out = Parsed::default();
     CTX.with_borrow_mut(|ctx| -> Result<()> {
-        let (tags, _has_errors) = ctx.generate_tags(&lang.cfg, src, None)?;
+        let (tags, _has_errors) = ctx.generate_tags(cfg, src, None)?;
         for tag in tags {
             let tag = tag?;
-            let kind = lang.cfg.syntax_type_name(tag.syntax_type_id);
+            let kind = cfg.syntax_type_name(tag.syntax_type_id);
             let name = text(tag.name_range.clone());
             let line = tag.span.start.row as u32 + 1;
             if tag.is_definition {
@@ -157,7 +175,9 @@ mod tests {
 
     #[test]
     fn all_queries_compile() {
-        assert_eq!(LANGS.len(), 6);
+        for l in &LANGS {
+            l.cfg();
+        }
     }
 
     #[test]
