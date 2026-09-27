@@ -7,7 +7,7 @@ use rusqlite::{Connection, Transaction, params};
 use crate::lang::Parsed;
 
 /// Bump on any schema change: an index with another version is dropped and rebuilt.
-const VERSION: i32 = 1;
+const VERSION: i32 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE files(
@@ -22,13 +22,15 @@ CREATE TABLE symbols(
     kind     TEXT NOT NULL,
     line     INTEGER NOT NULL,
     end_line INTEGER NOT NULL,
-    sig      TEXT NOT NULL
+    sig      TEXT NOT NULL,
+    parent   TEXT -- enclosing class/interface/impl, NULL for free definitions
 );
 CREATE TABLE refs(
     file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     name    TEXT NOT NULL,
     kind    TEXT NOT NULL,
-    line    INTEGER NOT NULL
+    line    INTEGER NOT NULL,
+    qual    TEXT -- receiver/qualifier (`x` in `x.f()`), NULL for a bare name
 );
 CREATE TABLE imports(
     file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -83,13 +85,13 @@ pub fn put_file(tx: &Transaction, path: &str, mtime: i64, size: i64, p: &Parsed)
     tx.prepare_cached("INSERT INTO files(path, mtime, size) VALUES (?1, ?2, ?3)")?
         .execute(params![path, mtime, size])?;
     let id = tx.last_insert_rowid();
-    let mut s = tx.prepare_cached("INSERT INTO symbols VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?;
+    let mut s = tx.prepare_cached("INSERT INTO symbols VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
     for d in &p.defs {
-        s.execute(params![id, d.name, d.kind, d.line, d.end_line, d.sig])?;
+        s.execute(params![id, d.name, d.kind, d.line, d.end_line, d.sig, d.parent])?;
     }
-    let mut s = tx.prepare_cached("INSERT INTO refs VALUES (?1, ?2, ?3, ?4)")?;
+    let mut s = tx.prepare_cached("INSERT INTO refs VALUES (?1, ?2, ?3, ?4, ?5)")?;
     for r in &p.refs {
-        s.execute(params![id, r.name, r.kind, r.line])?;
+        s.execute(params![id, r.name, r.kind, r.line, r.qual])?;
     }
     let mut s = tx.prepare_cached("INSERT INTO imports VALUES (?1, ?2)")?;
     for m in &p.imports {

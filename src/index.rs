@@ -16,13 +16,6 @@ const MAX_FILE_BYTES: u64 = 16 << 20;
 /// Parsed files buffered ahead of the SQLite writer.
 const CHANNEL: usize = 256;
 
-/// Minified/bundled code: huge lines, junk one-letter symbols. Indexed as an empty file
-/// so its stamp is stored and it isn't re-read every run.
-// ponytail: average-line-length heuristic; a mostly-normal file with one giant data line can trip it
-fn minified(src: &[u8]) -> bool {
-    src.len() > 4096 && src.len() / (src.iter().filter(|&&b| b == b'\n').count() + 1) > 500
-}
-
 #[derive(Debug, Default, PartialEq)]
 pub struct Stats {
     pub parsed: usize,
@@ -61,9 +54,7 @@ pub fn index(root: &Path, conn: &mut Connection) -> Result<Stats> {
     thread::scope(|s| -> Result<()> {
         s.spawn(|| {
             todo.par_iter().for_each_with(send, |send, (rel, stamp)| {
-                let res = std::fs::read(root.join(rel)).map_err(Into::into).and_then(|src| {
-                    if minified(&src) { Ok(Some(lang::Parsed::default())) } else { lang::parse(Path::new(rel), &src) }
-                });
+                let res = std::fs::read(root.join(rel)).map_err(Into::into).and_then(|src| lang::parse(Path::new(rel), &src));
                 let _ = send.send((rel, stamp, res)); // receiver gone = writer failed; just drain
             })
         });
@@ -90,7 +81,10 @@ pub fn index(root: &Path, conn: &mut Connection) -> Result<Stats> {
 /// Supported, not-ignored source files under `root` as (relative path, (mtime, size)).
 fn walk(root: &Path) -> Vec<(String, (i64, i64))> {
     let (send, recv) = mpsc::channel();
-    ignore::WalkBuilder::new(root).require_git(false).build_parallel().run(|| {
+    // At a repo root, ignore files above it don't apply (git semantics), and checking every
+    // ancestor level per entry cost ~50 ms of a 230 ms refresh on TypeScript.
+    let parents = !root.join(".git").exists();
+    ignore::WalkBuilder::new(root).require_git(false).parents(parents).build_parallel().run(|| {
         let send = send.clone();
         Box::new(move |entry| {
             let Ok(entry) = entry.inspect_err(|e| eprintln!("sym: {e}")) else { return WalkState::Continue };
@@ -137,7 +131,8 @@ mod tests {
         let s = |parsed, unchanged, removed| Stats { parsed, unchanged, removed, failed: 0 };
 
         assert_eq!(index(&root, &mut conn).unwrap(), s(3, 0, 0));
-        assert_eq!(count(&conn, "SELECT count(*) FROM symbols"), 2); // minified file adds none
+        // Minified file: only names in its first 1000 columns (see lang::MAX_NAME_COLUMN).
+        assert_eq!(count(&conn, "SELECT count(*) FROM symbols"), 2 + 59);
         assert_eq!(count(&conn, "SELECT count(*) FROM refs WHERE name = 'b'"), 1);
         assert_eq!(count(&conn, "SELECT count(*) FROM imports WHERE module = 'os'"), 1);
         assert_eq!(count(&conn, "SELECT count(*) FROM files WHERE path = 'src/a.rs'"), 1);
@@ -149,9 +144,9 @@ mod tests {
         fs::write(root.join("src/a.rs"), "fn a2() {}\nfn a3() {}\n").unwrap();
         fs::remove_file(root.join("b.py")).unwrap();
         assert_eq!(index(&root, &mut conn).unwrap(), s(1, 1, 1));
-        assert_eq!(count(&conn, "SELECT count(*) FROM symbols"), 2);
+        assert_eq!(count(&conn, "SELECT count(*) FROM symbols"), 2 + 59);
         assert_eq!(count(&conn, "SELECT count(*) FROM symbols WHERE name = 'a'"), 0);
-        assert_eq!(count(&conn, "SELECT count(*) FROM refs"), 0);
+        assert_eq!(count(&conn, "SELECT count(*) FROM refs WHERE name != 'r'"), 0);
         assert_eq!(count(&conn, "SELECT count(*) FROM imports"), 0);
 
         // Reopening keeps the index (schema version matches).
