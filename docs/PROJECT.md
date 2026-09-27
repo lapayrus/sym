@@ -60,7 +60,10 @@ query latency, and tokens per task versus `rg`.
 | 3 | CLI: `def`, `refs`, `search`, `calls`, `outline` (clap) | correct answers on this repo and on ripgrep | ✅ done |
 | 4 | `sym serve` MCP server, 5 tools | works via `claude mcp add sym -- sym serve` | ✅ done (stdio smoke-tested; not yet run inside Claude Code) |
 | 5 | Watch mode (`notify` + background re-index thread inside `serve`) | an edit shows up in queries in < 100 ms | ✅ done (9–19 ms write → answer on TypeScript) |
-| 6 | Benchmarks + README | published numbers vs `rg` | ⏳ next |
+| 6 | Benchmarks + README | published numbers vs `rg` | ✅ done (`bench/bench.py`, README tables for ripgrep + TypeScript) |
+
+Next candidates (not scheduled): type-usage refs (`@reference.type` per language), run `sym serve` inside Claude Code
+and tune tool descriptions, publish binaries.
 
 MCP tools: `find_def(name)`, `find_refs(name, limit?)`, `search(query, limit?)`,
 `calls(name, direction? = callers|callees, limit?)`, `outline(path)`.
@@ -85,6 +88,10 @@ MCP tools: `find_def(name)`, `find_refs(name, limit?)`, `search(query, limit?)`,
   thread that runs `refresh` (scoped `index::index` over the drained set, nothing if empty) after `SETTLE` (20 ms);
   each tool call runs `refresh` too, then the matching `query` fn.
 - Index location: `.sym/index.db` at the repo root (gitignored).
+- `bench/bench.py SYM RG REPO --symbol .. --file .. --edit ..`: prints the README's markdown tables (index costs,
+  then per-task sym CLI / serve / rg time, lines and ≈ tokens). Wall clock, median of 5 after a warm-up.
+  Baselines: rg def regex, `rg -w`, `rg '\bNAME\s*\('`, and reading the whole file for outline.
+- `README.md`: install, MCP setup, CLI sample, benchmark tables, limitations.
 
 Benchmarks (release, Windows, 16 threads, warm OS cache):
 
@@ -112,6 +119,12 @@ Query latency on TypeScript (31k files), excluding the refresh (end-to-end CLI t
 | `search gtos` / `search s` | 24 ms / 59 ms |
 | `outline checker.ts` (3 MiB) | 11 ms |
 
+The tables above are internal (`sym index` "in X") times; README numbers are wall clock with process start
+(≈ +20–60 ms on Windows). Benchmarking pitfalls: rg quits at the first match when stdout is `/dev/null`
+(1.0 s vs a real 2.3 s on TypeScript), and searches stdin instead of the dir when stdin is readable (20 ms,
+no output); `bench.py` pipes stdout and closes stdin. A freshly written DB gets scanned by antivirus, which
+inflated the first warm run to ~670 ms; `bench.py` waits 3 s after the cold runs.
+
 The first-ever cold run on a fresh clone took 49.8 s: the OS/antivirus was scanning
 newly written files. Benchmarks must use a warm cache, and should report the cold-cache run separately.
 
@@ -138,6 +151,8 @@ Known limits (also marked `ponytail:` in the code):
 
 ## Changelog
 
+- 2026-09-28: V1 complete (roadmap phases 0–6). Further work goes in "Next candidates" under Roadmap.
+- 2026-09-28: Phase 6 done. `bench/bench.py` + `README.md` with numbers vs rg 14.1.1 on ripgrep and TypeScript (serve queries 0.1–19 ms vs rg 2.3 s at 31k files; outlines 6–16× fewer tokens, refs up to 8.7×). Benchmark found ambiguous sites repeated under every candidate (491 lines for `refs search_reader`): now listed once under `? one of a:1, b:2 +N` (148 lines). Documented the type-usage refs gap.
 - 2026-09-28: Watch-mode limits fixed before phase 6. Background re-index thread (20 ms settle, conn behind a mutex) so edit cost is paid before the next tool call: 1.4 MiB edit answered in 0 ms after 1 s (was ~650 ms on the call). Scoped updates look up stamps per changed path (`db::known_under`) instead of loading all: small edit → answer 38–42 → 9–19 ms. Measured big-file breakdown; incremental re-parse deferred (saves ≤ 1/3).
 - 2026-09-28: Phase 5 done. Watch mode in `sym serve`: `notify` (adds dep; skipped `notify-debouncer-mini`, lazy drain makes debounce moot) records changed paths, each tool call runs a scoped `index::index` (new `changed` arg). TypeScript: no-change call 175 → 0.2 ms, edit → answer 38–42 ms. Tests: scoped index + real watcher (edit, dir delete).
 - 2026-09-28: Phase 4 done. `sym serve`: sync stdio MCP server (`mcp.rs`, adds `serde_json`) with the 5 tools wrapping `query.rs`, refresh per call. Protocol test + stdio smoke test pass; not yet exercised inside Claude Code.
