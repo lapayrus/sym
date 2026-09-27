@@ -260,14 +260,16 @@ impl<'c> Resolver<'c> {
     }
 }
 
-/// References to `query` (optionally `kind`), bucketed by the definition they resolve to.
-/// Returns (shown targets, per-target sites with an ambiguity flag, unresolved sites).
-#[allow(clippy::type_complexity)]
-fn resolved_sites(
-    conn: &Connection,
-    query: &str,
-    kind: Option<&str>,
-) -> Result<(Vec<Target>, Vec<Vec<(Site, bool)>>, Vec<Site>)> {
+/// `a:1, b:2, c:3 +2`: the first three of some candidate definitions' locations.
+fn locations(at: Vec<String>) -> String {
+    let more = if at.len() > 3 { format!(" +{}", at.len() - 3) } else { String::new() };
+    format!("{}{more}", at[..at.len().min(3)].join(", "))
+}
+
+/// References to `query` (optionally `kind`) as (header, sites) groups: one per definition they
+/// resolve to, one per set of definitions they could equally mean (`? one of a:1, b:2`, each
+/// site listed once), then the unresolved ones.
+fn site_groups(conn: &Connection, query: &str, kind: Option<&str>) -> Result<Vec<(String, Vec<Site>)>> {
     let (parent, name) = split_qualified(query);
     let mut all = merge_overloads(targets(conn, name, None, 1000)?);
     let mut name = name;
@@ -283,36 +285,36 @@ fn resolved_sites(
         Ok(Site { file_id: r.get(0)?, path: r.get(1)?, line: r.get(2)?, kind: r.get(3)?, qual: r.get(4)? })
     })?;
     let mut res = Resolver::new(conn);
-    let mut buckets: Vec<Vec<(Site, bool)>> = (0..all.len()).map(|_| Vec::new()).collect();
+    let mut buckets: Vec<Vec<Site>> = (0..all.len()).map(|_| Vec::new()).collect();
+    let mut ambiguous: Vec<(Vec<usize>, Vec<Site>)> = Vec::new();
     let mut unresolved = Vec::new();
     for site in sites {
         let site = site?;
         let hits = if all.is_empty() { Vec::new() } else { res.resolve(&site, &all)? };
         match hits.as_slice() {
             [] => unresolved.push(site),
-            [i] => buckets[*i].push((site, false)),
-            many => {
-                for &i in many {
-                    buckets[i].push((site.clone(), true));
-                }
-            }
+            [i] => buckets[*i].push(site),
+            many => match ambiguous.iter_mut().find(|(c, _)| c == many) {
+                Some((_, sites)) => sites.push(site),
+                None => ambiguous.push((many.to_vec(), vec![site])),
+            },
         }
     }
     // A qualified query shows only the matching members; the rest only competed in resolution.
     let keep: Vec<bool> = all.iter().map(|t| name == query || parent.is_none() || t.parent.as_deref() == parent).collect();
     let keep = if keep.contains(&true) { keep } else { vec![true; all.len()] };
-    let mut shown = Vec::new();
-    let mut shown_buckets = Vec::new();
-    for ((t, b), k) in all.into_iter().zip(buckets).zip(keep) {
-        if k {
-            shown.push(t);
-            shown_buckets.push(b);
+    let mut groups: Vec<(String, Vec<Site>)> =
+        all.iter().zip(buckets).zip(&keep).filter(|(_, k)| **k).map(|((t, b), _)| (t.header(), b)).collect();
+    for (cands, sites) in ambiguous {
+        if cands.iter().any(|&i| keep[i]) {
+            let at = cands.iter().map(|&i| format!("{}:{}", all[i].path, all[i].line)).collect();
+            groups.push((format!("? one of {}", locations(at)), sites));
         }
     }
-    if parent.is_some() && name != query {
-        unresolved.clear();
+    if parent.is_none() || name == query {
+        groups.push((UNRESOLVED.to_string(), unresolved));
     }
-    Ok((shown, shown_buckets, unresolved))
+    Ok(groups)
 }
 
 /// Append `path:line-end kind sig` for every definition of `name`, at most `limit` lines.
@@ -338,32 +340,25 @@ pub fn def(conn: &Connection, query: &str) -> Result<String> {
 const UNRESOLVED: &str = "(unresolved: external, or no matching definition indexed)";
 
 /// Every reference to `query`, per definition it resolves to, grouped by file, each with its
-/// enclosing definition. `?` marks a reference that could equally mean another definition.
+/// enclosing definition. A `? one of ...` group holds references that could mean several.
 pub fn refs(conn: &Connection, query: &str, limit: usize) -> Result<String> {
-    let (targets, buckets, unresolved) = resolved_sites(conn, query, None)?;
-    let groups = targets
-        .iter()
-        .map(Target::header)
-        .zip(buckets)
-        .chain([(UNRESOLVED.to_string(), unresolved.into_iter().map(|s| (s, false)).collect())]);
     let mut out = String::new();
     let (mut shown, mut total) = (0, 0);
-    for (header, sites) in groups {
+    for (header, sites) in site_groups(conn, query, None)? {
         total += sites.len();
         if sites.is_empty() || shown >= limit {
             continue;
         }
         writeln!(out, "{header}")?;
         let mut last = String::new();
-        for (s, ambiguous) in sites.iter().take(limit - shown) {
+        for s in sites.iter().take(limit - shown) {
             if s.path != last {
                 writeln!(out, "  {}", s.path)?;
                 last.clone_from(&s.path);
             }
-            let mark = if *ambiguous { "?" } else { "" };
             match enclosing(conn, s.file_id, s.line)? {
-                Some(c) => writeln!(out, "    {}{mark} {} in {}", s.line, s.kind, c.name)?,
-                None => writeln!(out, "    {}{mark} {}", s.line, s.kind)?,
+                Some(c) => writeln!(out, "    {} {} in {}", s.line, s.kind, c.name)?,
+                None => writeln!(out, "    {} {}", s.line, s.kind)?,
             }
             shown += 1;
         }
@@ -419,17 +414,11 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<String> {
 }
 
 /// Who calls `query`: per definition it resolves to, one line per calling definition with its
-/// call-site lines (`?` = could equally be a call to another definition of the same name).
+/// call-site lines. A `? one of ...` group holds calls that could mean several definitions.
 pub fn callers(conn: &Connection, query: &str, limit: usize) -> Result<String> {
-    let (targets, buckets, unresolved) = resolved_sites(conn, query, Some("call"))?;
-    let groups = targets
-        .iter()
-        .map(Target::header)
-        .zip(buckets)
-        .chain([(UNRESOLVED.to_string(), unresolved.into_iter().map(|s| (s, false)).collect())]);
     let mut out = String::new();
     let (mut shown, mut total) = (0, 0);
-    for (header, sites) in groups {
+    for (header, sites) in site_groups(conn, query, Some("call"))? {
         total += sites.len();
         if sites.is_empty() || shown >= limit {
             continue;
@@ -437,9 +426,9 @@ pub fn callers(conn: &Connection, query: &str, limit: usize) -> Result<String> {
         writeln!(out, "{header}")?;
         // (path, caller name, caller line, call lines); a caller's calls are contiguous.
         let mut lines: Vec<(&str, Option<Caller>, Vec<String>)> = Vec::new();
-        for (s, ambiguous) in sites.iter().take(limit - shown) {
+        for s in sites.iter().take(limit - shown) {
             let caller = enclosing(conn, s.file_id, s.line)?;
-            let at = format!("{}{}", s.line, if *ambiguous { "?" } else { "" });
+            let at = s.line.to_string();
             match lines.last_mut() {
                 Some((p, c, ls)) if *p == s.path && c.as_ref().map(|c| c.line) == caller.as_ref().map(|c| c.line) => {
                     ls.push(at)
@@ -494,11 +483,7 @@ pub fn callees(conn: &Connection, query: &str, limit: usize) -> Result<String> {
                     continue;
                 }
                 [i] => format!("  {name} {}", at(i)),
-                many => {
-                    let shown: Vec<String> = many.iter().take(3).map(at).collect();
-                    let more = if many.len() > 3 { format!(" +{}", many.len() - 3) } else { String::new() };
-                    format!("  {name}? {}{more}", shown.join(", "))
-                }
+                many => format!("  {name}? {}", locations(many.iter().map(at).collect())),
             };
             if !lines.contains(&entry) {
                 lines.push(entry);
@@ -677,8 +662,8 @@ mod tests {
         // Bare `open()` in io.rs is io's own; `opener.open()` can't pick between io and fs.
         assert_eq!(
             callers(&conn, "open", 50).unwrap(),
-            "src/fs.rs:1-1 function pub fn open()\n  src/search.rs:6 run (9?)\n\
-             src/io.rs:1-1 function pub fn open()\n  src/io.rs:2 open_all (2)\n  src/search.rs:6 run (9?)\n"
+            "src/io.rs:1-1 function pub fn open()\n  src/io.rs:2 open_all (2)\n\
+             ? one of src/fs.rs:1, src/io.rs:1\n  src/search.rs:6 run (9)\n"
         );
         assert_eq!(
             callees(&conn, "Worker.run", 50).unwrap(),

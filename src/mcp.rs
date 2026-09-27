@@ -147,7 +147,7 @@ fn tools() -> Value {
         },
         {
             "name": "find_refs",
-            "description": "Where a symbol is referenced, grouped by resolved definition then file, with the enclosing definition of each site. `?` marks an ambiguous target.",
+            "description": "Where a symbol is referenced, grouped by resolved definition then file, with the enclosing definition of each site. A `? one of path:line, ...` group holds references that could mean several definitions.",
             "inputSchema": {"type": "object", "properties": {"name": name, "limit": limit}, "required": ["name"]},
         },
         {

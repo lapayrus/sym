@@ -35,7 +35,7 @@ query latency, and tokens per task versus `rg`.
 | Call graph | no edge table; the caller is the innermost def whose line span contains the call ref (indexed `(file_id, line)` lookup) | zero resolution pass | — |
 | CLI freshness | every CLI command runs an incremental refresh before answering | stale answers are the worst failure for an agent; refresh is 10 ms on ripgrep | big repos (175 ms at 31k files) → use `sym serve` (watch mode) |
 | Watch mode | `notify` (no debouncer crate) callback records changed repo-relative paths in a shared set and wakes a background thread, which waits for 20 ms of quiet, then runs a scoped `index::index` (walk from the root, descending only into ancestors of changed paths, so every `.gitignore` still applies; stamps looked up per changed path). Each tool call also drains the set first, so nothing pending is missed; the connection is behind one mutex, so a call arriving mid-update waits for it. Watcher error/overflow, or a root ignore-file edit, → full rescan; a nested ignore-file edit → rescan its dir. `.sym`/`.git` and existing unsupported files are dropped at event time | edit cost is paid while the agent thinks: a 1.4 MiB file (~650 ms) is ready 1 s later; small edit → answer 9–19 ms at 66k files | a query right after saving a huge file must be fast → incremental re-parse (see Known limits) |
-| Output format | plain text, one line per hit, `path:line-end kind [in Parent:] sig`; refs/calls grouped per resolved definition, then by file; `?` = ambiguous | fewest tokens; `line-end` lets an agent read the exact span | an MCP client needs structured output |
+| Output format | plain text, one line per hit, `path:line-end kind [in Parent:] sig`; refs/calls grouped per resolved definition, then by file; sites that could mean several definitions are listed once under `? one of a:1, b:2 +N` (callees: `name? a:1, ...`) | fewest tokens; `line-end` lets an agent read the exact span | an MCP client needs structured output |
 | Root discovery | `--root`, else nearest ancestor with `.sym` or `.git`, else cwd | works from any subdir | — |
 | Reference resolution | syntactic, at query time (`query.rs` `Resolver`). Defs store `parent` (enclosing class/interface/impl, Go receiver), refs store `qual` (receiver/qualifier). Same language family only. Bare `f()` → free defs; `self.f()` → caller's own type; `Q.f()` → type `Q`, else a type ending in `Q` (`searcher` → `Searcher`), else module `Q`; capitalized/`::` `Q` with no match → external. Ties: same file → best import path match → same dir. TS overloads merge into one target | no types needed, one pass per query; fixed ripgrep's two `search_path`s and all 388 `getTypeOfSymbol` call sites on TypeScript | a receiver name says nothing about its type (`x.run()` with many `run` methods stays `?`) → per-language type inference |
 | Qualified queries | `def`/`refs`/`calls` accept `Parent.name` / `Parent::name` | pick one member | — |
@@ -117,7 +117,11 @@ newly written files. Benchmarks must use a warm cache, and should report the col
 
 Known limits (also marked `ponytail:` in the code):
 - Resolution is syntactic, not type-based: `x.run()` with several project `run` methods and an
-  uninformative receiver name is shown under each with `?`.
+  uninformative receiver name lands in a `? one of ...` group.
+- Type usages are only partly references: refs are calls (all languages), `new X` (JS/TS), the type positions the
+  TS/Go `tags.scm` capture, and `impl Trait for` (Rust). So in Rust `refs Searcher` finds no `&mut Searcher`
+  annotations and no `Searcher::new()` (stored as a call to `new` with qualifier `Searcher`). Fix: extra
+  `@reference.type` patterns per language (more rows).
 - Minified files: symbols in the first 1000 columns of a minified line still get indexed (bounded junk).
 - Huge files re-index whole: a 1.4 MiB edit costs ~650 ms (1.1 s for 3 MiB `checker.ts`). `serve` hides it in the
   background, so only a query sent within that window waits; the CLI always pays it. Incremental re-parse with a
