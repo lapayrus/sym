@@ -33,7 +33,8 @@ query latency, and tokens per task versus `rg`.
 | Storage | SQLite (`rusqlite`, bundled) | point lookups in µs, joins for call graph, transactional per-file updates | `find_def` p99 > 1 ms on a Chromium-size repo → `redb` + in-memory maps |
 | Rejected storage | Sled (stalled), RocksDB (heavy C++ build, KV only), DuckDB (OLAP, weak point lookups), GlueSQL (immature) | — | — |
 | Call graph | no edge table; the caller is the innermost def whose line span contains the call ref (indexed `(file_id, line)` lookup) | zero resolution pass | — |
-| CLI freshness | every CLI command runs an incremental refresh before answering | stale answers are the worst failure for an agent; refresh is 10 ms on ripgrep | big repos (175 ms at 31k files) → use `sym serve` + watch (phases 4–5) |
+| CLI freshness | every CLI command runs an incremental refresh before answering | stale answers are the worst failure for an agent; refresh is 10 ms on ripgrep | big repos (175 ms at 31k files) → use `sym serve` (watch mode) |
+| Watch mode | `notify` (no debouncer) callback records changed repo-relative paths in a shared set; each MCP tool call drains it and runs a scoped `index::index` (walk from the root, descending only into ancestors of changed paths, so every `.gitignore` still applies). Watcher error/overflow, or a root ignore-file edit, → full rescan; a nested ignore-file edit → rescan its dir. `.sym`/`.git` and existing unsupported files are dropped at event time | lazy drain means no debounce, no second connection, no locking beyond one mutex; edit → answer 38 ms at 31k files | parse cost of a big edited file must be hidden → eager background re-index thread |
 | Output format | plain text, one line per hit, `path:line-end kind [in Parent:] sig`; refs/calls grouped per resolved definition, then by file; `?` = ambiguous | fewest tokens; `line-end` lets an agent read the exact span | an MCP client needs structured output |
 | Root discovery | `--root`, else nearest ancestor with `.sym` or `.git`, else cwd | works from any subdir | — |
 | Reference resolution | syntactic, at query time (`query.rs` `Resolver`). Defs store `parent` (enclosing class/interface/impl, Go receiver), refs store `qual` (receiver/qualifier). Same language family only. Bare `f()` → free defs; `self.f()` → caller's own type; `Q.f()` → type `Q`, else a type ending in `Q` (`searcher` → `Searcher`), else module `Q`; capitalized/`::` `Q` with no match → external. Ties: same file → best import path match → same dir. TS overloads merge into one target | no types needed, one pass per query; fixed ripgrep's two `search_path`s and all 388 `getTypeOfSymbol` call sites on TypeScript | a receiver name says nothing about its type (`x.run()` with many `run` methods stays `?`) → per-language type inference |
@@ -58,8 +59,8 @@ query latency, and tokens per task versus `rg`.
 | 2 | `db.rs` + `index.rs`: SQLite store, full + incremental index | second `sym index` re-parses 0 files | ✅ done |
 | 3 | CLI: `def`, `refs`, `search`, `calls`, `outline` (clap) | correct answers on this repo and on ripgrep | ✅ done |
 | 4 | `sym serve` MCP server, 5 tools | works via `claude mcp add sym -- sym serve` | ✅ done (stdio smoke-tested; not yet run inside Claude Code) |
-| 5 | Watch mode (`notify-debouncer-mini`, thread inside `serve`) | an edit shows up in queries in < 100 ms | ⏳ next |
-| 6 | Benchmarks + README | published numbers vs `rg` | ⏳ |
+| 5 | Watch mode (`notify` inside `serve`, applied lazily per tool call) | an edit shows up in queries in < 100 ms | ✅ done (38–42 ms write → answer on TypeScript) |
+| 6 | Benchmarks + README | published numbers vs `rg` | ⏳ next |
 
 MCP tools: `find_def(name)`, `find_refs(name, limit?)`, `search(query, limit?)`,
 `calls(name, direction? = callers|callees, limit?)`, `outline(path)`.
@@ -72,14 +73,16 @@ MCP tools: `find_def(name)`, `find_refs(name, limit?)`, `search(query, limit?)`,
 - `src/db.rs`: `open(root)`, `known_files`, `put_file` (delete + insert, cascading), `remove_file`. Schema version 2.
   Tables: `files`, `symbols(name, kind, line, end_line, sig, parent)`, `refs(name, kind, line, qual)`, `imports(module)`.
   Indexes on `name`/`module` and on `(file_id, line)`.
-- `src/index.rs`: `index(root, conn) -> Stats { parsed, unchanged, removed, failed }`.
+- `src/index.rs`: `index(root, conn, changed: Option<&HashSet<String>>) -> Stats { parsed, unchanged, removed, failed }`;
+  `None` = whole tree, `Some` = only those repo-relative files/dirs (watch mode). `rel(root, path)` gives the stored path form.
 - `src/query.rs`: `def`, `refs(limit)`, `search(limit)`, `callers(limit)`, `callees(limit)`, `outline(path)`, plus the
   `Resolver`. Each returns ready-to-print text; phase 4's MCP tools should wrap these directly.
   `callees` lists resolved callees with locations, then `external: ...`.
 - `src/main.rs`: clap CLI: `sym [--root R] index|def NAME|refs NAME|search Q|calls NAME [--callees]|outline PATH`.
   Every command refreshes the index first. `outline` accepts a path relative to cwd, or a suffix such as `db.rs`.
 - `src/mcp.rs`: `sym serve`. Reads JSON-RPC lines from stdin, handles `initialize`/`ping`/`tools/list`/`tools/call`,
-  ignores notifications. Keeps one connection open; each tool call runs `index::index` then the matching `query` fn.
+  ignores notifications. Keeps one connection open. `watch` (notify) fills a `Changed` set; each tool call runs
+  `refresh` (scoped `index::index` over the drained set, nothing if empty) then the matching `query` fn.
 - Index location: `.sym/index.db` at the repo root (gitignored).
 
 Benchmarks (release, Windows, 16 threads, warm OS cache):
@@ -88,6 +91,9 @@ Benchmarks (release, Windows, 16 threads, warm OS cache):
 |---|---|---|---|---|---|
 | ripgrep | 110 | 125 ms | 10 ms | 26 ms | 1.6 MB |
 | TypeScript (microsoft) | 31,443 | 5.9 s | 175 ms | 1.1 s (3 MiB `checker.ts`) | 63 MB |
+
+`sym serve` on TypeScript (66,684 files in the clone): tool call with no pending changes 0.2 ms; write a new
+file → `find_def` answer 38–42 ms (102 ms first time, cold); delete → 29 ms.
 
 Warm refresh breakdown on TypeScript (66,684 files in 653 dirs): directory walk ≈ 70 ms, root `.gitignore`
 matching ≈ 50 ms, global excludes ≈ 35 ms, `known_files` ≈ 17 ms, DB open 2 ms.
@@ -111,10 +117,13 @@ Known limits (also marked `ponytail:` in the code):
   uninformative receiver name is shown under each with `?`.
 - Minified files: symbols in the first 1000 columns of a minified line still get indexed (bounded junk).
 - Huge files are bound by tree-sitter itself: `checker.ts` (3 MiB) takes ~1 s to re-index after an edit.
-  Fix: incremental re-parse with the retained old tree, in watch mode (phase 5). Needs a long-lived process;
-  a CLI call can't keep trees.
-- Warm refresh is O(files) (175 ms at 31k files), and every CLI query and MCP tool call pays it. The walk itself is the floor
-  (≈ 70 ms raw `read_dir` on Windows); only watch mode (phase 5) removes it.
+  Fix: incremental re-parse with the retained old tree inside `serve` (not done in phase 5; watch mode re-parses
+  changed files from scratch). A CLI call can't keep trees.
+- Warm refresh is O(files) (175 ms at 31k files), and every CLI query pays it. The walk itself is the floor
+  (≈ 70 ms raw `read_dir` on Windows); `sym serve` avoids it via watch mode.
+- Watch mode: a scoped update still loads every known file's stamp (~17 ms at 31k files) before filtering; an event the OS
+  hasn't delivered when a tool call starts is picked up by the next call (not observed in practice: write-then-query caught it).
+  The changed file is parsed during the tool call, so editing `checker.ts` makes the next call ~1 s.
 - `refs`/`calls` resolve every reference of the name (18 ms for ~500 refs); a name with 100k refs costs
   proportionally. Fine until measured otherwise.
 - Anonymous callbacks without a string argument (`setTimeout(() => ..)`, `arr.map(x => ..)` at top level) still
@@ -122,6 +131,7 @@ Known limits (also marked `ponytail:` in the code):
 
 ## Changelog
 
+- 2026-09-28: Phase 5 done. Watch mode in `sym serve`: `notify` (adds dep; skipped `notify-debouncer-mini`, lazy drain makes debounce moot) records changed paths, each tool call runs a scoped `index::index` (new `changed` arg). TypeScript: no-change call 175 → 0.2 ms, edit → answer 38–42 ms. Tests: scoped index + real watcher (edit, dir delete).
 - 2026-09-28: Phase 4 done. `sym serve`: sync stdio MCP server (`mcp.rs`, adds `serde_json`) with the 5 tools wrapping `query.rs`, refresh per call. Protocol test + stdio smoke test pass; not yet exercised inside Claude Code.
 - 2026-09-28: Fixed phase 3 known limits before phase 4. Replaced `tree-sitter-tags` with direct `Query` use (keeps the tree); syntax-aware signatures; `parent`/`qual` columns (schema v2) and a syntactic resolver for refs/calls/callees; TS overloads merged; JS/Go callback defs; Rust `impl` defs; column-based minified filter replaces the whole-file heuristic; nucleo + initials ranking in `search`; `parents(false)` at repo roots. TypeScript: cold 7.0 → 5.9 s, warm 310 → 175 ms, `calls getTypeOfSymbol` 0 ambiguous of 388.
 - 2026-09-28: Phase 3 done. clap CLI with `def`/`refs`/`search`/`calls`/`outline` in `query.rs`; auto-refresh before each query; root discovery. Verified on this repo and ripgrep (`calls search_path` matches all 8 `rg` call sites). Queries run in 0.4–42 ms on TypeScript.

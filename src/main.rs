@@ -76,8 +76,8 @@ fn main() -> anyhow::Result<()> {
     let t = Instant::now();
     let mut conn = db::open(&root)?;
     // Every query refreshes first so answers are never stale.
-    // ponytail: O(files) stat walk per CLI call (~14 ms ripgrep, ~310 ms TypeScript); `sym serve` + watch mode (phase 5) avoids it
-    let s = index::index(&root, &mut conn)?;
+    // ponytail: O(files) stat walk per CLI call (~14 ms ripgrep, ~310 ms TypeScript); `sym serve` (watch mode) avoids it
+    let s = index::index(&root, &mut conn, None)?;
     let out = match cli.cmd {
         Cmd::Index => format!(
             "parsed {} unchanged {} removed {} failed {} in {:.1?}\n",

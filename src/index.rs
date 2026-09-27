@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::Metadata;
 use std::path::Path;
 use std::sync::mpsc;
@@ -28,14 +29,29 @@ fn mtime(meta: &Metadata) -> i64 {
     meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as i64)
 }
 
+/// `path` relative to `root`, `/`-separated (the form the index stores).
+pub fn rel(root: &Path, path: &Path) -> Option<String> {
+    Some(path.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/"))
+}
+
+/// Whether `rel` or one of its ancestor dirs is in `changed`.
+fn covered(changed: &HashSet<String>, rel: &str) -> bool {
+    changed.contains(rel) || rel.match_indices('/').any(|(i, _)| changed.contains(&rel[..i]))
+}
+
 /// Bring the index up to date with `root`: parse new/changed files, drop deleted ones.
+/// `changed` (watch mode) limits the run to those repo-relative files/dirs; `None` checks the whole tree.
 /// Change detection is `(mtime, size)`; everything happens in one transaction.
-pub fn index(root: &Path, conn: &mut Connection) -> Result<Stats> {
+pub fn index(root: &Path, conn: &mut Connection, changed: Option<&HashSet<String>>) -> Result<Stats> {
     let mut known = db::known_files(conn)?;
+    // ponytail: loads every known file even for a one-file update (~17 ms at 31k files); per-path lookup if it shows up
+    if let Some(c) = changed {
+        known.retain(|rel, _| covered(c, rel));
+    }
     let mut stats = Stats::default();
     let mut todo = Vec::new();
 
-    for (rel, stamp) in walk(root) {
+    for (rel, stamp) in walk(root, changed) {
         match known.remove(&rel) {
             Some(old) if old == stamp => stats.unchanged += 1,
             _ => todo.push((rel, stamp)),
@@ -78,13 +94,24 @@ pub fn index(root: &Path, conn: &mut Connection) -> Result<Stats> {
     Ok(stats)
 }
 
-/// Supported, not-ignored source files under `root` as (relative path, (mtime, size)).
-fn walk(root: &Path) -> Vec<(String, (i64, i64))> {
+/// Supported, not-ignored source files under `root` (only those `changed` covers, if given)
+/// as (relative path, (mtime, size)).
+fn walk(root: &Path, changed: Option<&HashSet<String>>) -> Vec<(String, (i64, i64))> {
     let (send, recv) = mpsc::channel();
     // At a repo root, ignore files above it don't apply (git semantics), and checking every
     // ancestor level per entry cost ~50 ms of a 230 ms refresh on TypeScript.
     let parents = !root.join(".git").exists();
-    ignore::WalkBuilder::new(root).require_git(false).parents(parents).build_parallel().run(|| {
+    let mut walker = ignore::WalkBuilder::new(root);
+    walker.require_git(false).parents(parents);
+    if let Some(c) = changed {
+        // Still walk from the root so every .gitignore on the way applies, but only descend
+        // into the ancestors of changed paths.
+        let c = c.clone();
+        let dirs: HashSet<String> = c.iter().flat_map(|p| p.match_indices('/').map(|(i, _)| p[..i].to_string())).collect();
+        let root = root.to_path_buf();
+        walker.filter_entry(move |e| rel(&root, e.path()).is_some_and(|r| r.is_empty() || dirs.contains(&r) || covered(&c, &r)));
+    }
+    walker.build_parallel().run(|| {
         let send = send.clone();
         Box::new(move |entry| {
             let Ok(entry) = entry.inspect_err(|e| eprintln!("sym: {e}")) else { return WalkState::Continue };
@@ -93,9 +120,8 @@ fn walk(root: &Path) -> Vec<(String, (i64, i64))> {
                 && lang::supported(path)
                 && let Ok(meta) = entry.metadata()
                 && meta.len() <= MAX_FILE_BYTES
-                && let Ok(rel) = path.strip_prefix(root)
+                && let Some(rel) = rel(root, path)
             {
-                let rel = rel.to_string_lossy().replace('\\', "/");
                 let _ = send.send((rel, (mtime(&meta), meta.len() as i64)));
             }
             WalkState::Continue
@@ -130,7 +156,7 @@ mod tests {
         let mut conn = db::open(&root).unwrap();
         let s = |parsed, unchanged, removed| Stats { parsed, unchanged, removed, failed: 0 };
 
-        assert_eq!(index(&root, &mut conn).unwrap(), s(3, 0, 0));
+        assert_eq!(index(&root, &mut conn, None).unwrap(), s(3, 0, 0));
         // Minified file: only names in its first 1000 columns (see lang::MAX_NAME_COLUMN).
         assert_eq!(count(&conn, "SELECT count(*) FROM symbols"), 2 + 59);
         assert_eq!(count(&conn, "SELECT count(*) FROM refs WHERE name = 'b'"), 1);
@@ -138,21 +164,33 @@ mod tests {
         assert_eq!(count(&conn, "SELECT count(*) FROM files WHERE path = 'src/a.rs'"), 1);
 
         // Nothing changed: nothing re-parsed.
-        assert_eq!(index(&root, &mut conn).unwrap(), s(0, 3, 0));
+        assert_eq!(index(&root, &mut conn, None).unwrap(), s(0, 3, 0));
 
         // Edit one file (size changes, so mtime granularity can't hide it), delete the other.
         fs::write(root.join("src/a.rs"), "fn a2() {}\nfn a3() {}\n").unwrap();
         fs::remove_file(root.join("b.py")).unwrap();
-        assert_eq!(index(&root, &mut conn).unwrap(), s(1, 1, 1));
+        assert_eq!(index(&root, &mut conn, None).unwrap(), s(1, 1, 1));
         assert_eq!(count(&conn, "SELECT count(*) FROM symbols"), 2 + 59);
         assert_eq!(count(&conn, "SELECT count(*) FROM symbols WHERE name = 'a'"), 0);
         assert_eq!(count(&conn, "SELECT count(*) FROM refs WHERE name != 'r'"), 0);
         assert_eq!(count(&conn, "SELECT count(*) FROM imports"), 0);
 
+        // Scoped (watch mode): only covered paths are looked at; ignore rules still apply.
+        fs::write(root.join("src/a.rs"), "fn a4() {}\nfn a5() {}\nfn a6() {}\n").unwrap();
+        fs::write(root.join("new.py"), "def n():\n    pass\n").unwrap();
+        fs::write(root.join("gen/y.rs"), "fn ignored2() {}\n").unwrap();
+        let only = |ps: &[&str]| ps.iter().map(|p| p.to_string()).collect::<HashSet<_>>();
+        assert_eq!(index(&root, &mut conn, Some(&only(&["new.py", "gen/y.rs"]))).unwrap(), s(1, 0, 0));
+        assert_eq!(count(&conn, "SELECT count(*) FROM symbols WHERE name = 'a4'"), 0);
+        assert_eq!(index(&root, &mut conn, Some(&only(&["src"]))).unwrap(), s(1, 0, 0));
+        assert_eq!(count(&conn, "SELECT count(*) FROM symbols WHERE name = 'a4'"), 1);
+        fs::remove_dir_all(root.join("src")).unwrap();
+        assert_eq!(index(&root, &mut conn, Some(&only(&["src"]))).unwrap(), s(0, 0, 1));
+
         // Reopening keeps the index (schema version matches).
         drop(conn);
         let mut conn = db::open(&root).unwrap();
-        assert_eq!(index(&root, &mut conn).unwrap(), s(0, 2, 0));
+        assert_eq!(index(&root, &mut conn, None).unwrap(), s(0, 2, 0));
 
         drop(conn);
         fs::remove_dir_all(&root).unwrap();

@@ -570,7 +570,7 @@ mod tests {
         )
         .unwrap();
         let mut conn = db::open(&root).unwrap();
-        index::index(&root, &mut conn).unwrap();
+        index::index(&root, &mut conn, None).unwrap();
 
         assert_eq!(def(&conn, "helper").unwrap(), "src/a.rs:1-1 function fn helper()\n");
         assert_eq!(def(&conn, "S.go").unwrap(), "src/a.rs:8-8 method in S: fn go(&self)\n");
@@ -657,7 +657,7 @@ mod tests {
         fs::write(root.join("o.ts"), "function f(a: number): void;\nfunction f(a: string): void;\nfunction f(a: any) {\n}\nf(1);\n")
             .unwrap();
         let mut conn = db::open(&root).unwrap();
-        index::index(&root, &mut conn).unwrap();
+        index::index(&root, &mut conn, None).unwrap();
 
         // TS overloads resolve as one callable; `def` still lists each signature.
         assert_eq!(callers(&conn, "f", 50).unwrap(), "o.ts:3-4 function function f(a: any)\n  o.ts <top level> (5)\n");

@@ -1,25 +1,35 @@
 //! `sym serve`: MCP server over stdio. Newline-delimited JSON-RPC 2.0, synchronous,
-//! one request at a time. Each tool call refreshes the index, then wraps a `query` fn.
+//! one request at a time. A file watcher records changed paths; each tool call re-indexes
+//! just those, then wraps a `query` fn.
 
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow, bail};
+use notify::{EventKind, RecursiveMode, Watcher};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
-use crate::{db, index, query};
+use crate::{db, index, lang, query};
+
+/// Repo-relative paths changed since the last refresh; `None` = watcher lost track, rescan everything.
+type Changed = Arc<Mutex<Option<HashSet<String>>>>;
 
 pub fn serve(root: &Path) -> Result<()> {
+    let changed: Changed = Arc::new(Mutex::new(Some(HashSet::new())));
+    // Watch before the first index so no edit falls in between.
+    let _watcher = watch(root, changed.clone())?;
     let mut conn = db::open(root)?;
-    index::index(root, &mut conn)?;
+    index::index(root, &mut conn, None)?;
     let mut out = std::io::stdout().lock();
     for line in std::io::stdin().lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(resp) = handle(root, &mut conn, &line) {
+        if let Some(resp) = handle(root, &mut conn, &changed, &line) {
             writeln!(out, "{resp}")?;
             out.flush()?;
         }
@@ -27,8 +37,57 @@ pub fn serve(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Record OS file events in `changed`. Queries apply them lazily, so no debounce is needed.
+fn watch(root: &Path, changed: Changed) -> Result<notify::RecommendedWatcher> {
+    let base = root.to_path_buf();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        let mut c = changed.lock().unwrap();
+        let ev = match res {
+            Ok(ev) if !ev.need_rescan() => ev,
+            _ => return *c = None, // event overflow or watcher error
+        };
+        if matches!(ev.kind, EventKind::Access(_)) {
+            return; // our own reads
+        }
+        for p in &ev.paths {
+            let Some(rel) = index::rel(&base, p) else { continue };
+            if matches!(rel.split('/').next(), Some(".sym" | ".git")) {
+                continue; // our own db writes, git internals
+            }
+            let rel = if matches!(p.file_name().and_then(|n| n.to_str()), Some(".gitignore" | ".ignore")) {
+                // An ignore-file edit can (un)ignore anything below it.
+                rel.rsplit_once('/').map_or("", |(dir, _)| dir).to_string()
+            } else if p.is_file() && !lang::supported(p) {
+                continue; // build output etc.; keeps the set small
+            } else {
+                rel
+            };
+            match c.as_mut() {
+                Some(set) if !rel.is_empty() => _ = set.insert(rel),
+                _ => *c = None,
+            }
+        }
+    })?;
+    watcher.watch(root, RecursiveMode::Recursive)?;
+    Ok(watcher)
+}
+
+/// Re-index what changed since the last call (the whole tree if the watcher lost track).
+/// ponytail: an event not yet delivered when the query runs is missed until the next call (OS latency is ~ms); fine for agents
+fn refresh(root: &Path, conn: &mut Connection, changed: &Changed) -> Result<()> {
+    let taken = changed.lock().unwrap().replace(HashSet::new());
+    let res = match &taken {
+        Some(set) if set.is_empty() => return Ok(()),
+        scope => index::index(root, conn, scope.as_ref()),
+    };
+    if res.is_err() {
+        *changed.lock().unwrap() = None; // don't lose the changes: rescan next time
+    }
+    res.map(drop)
+}
+
 /// One JSON-RPC message in, at most one response out (notifications get none).
-fn handle(root: &Path, conn: &mut Connection, line: &str) -> Option<Value> {
+fn handle(root: &Path, conn: &mut Connection, changed: &Changed, line: &str) -> Option<Value> {
     let msg: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => return Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": e.to_string()}})),
@@ -44,7 +103,7 @@ fn handle(root: &Path, conn: &mut Connection, line: &str) -> Option<Value> {
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
-        "tools/call" => call(root, conn, params),
+        "tools/call" => call(root, conn, changed, params),
         m => Err((-32601, format!("method not found: {m}"))),
     };
     Some(match result {
@@ -89,24 +148,23 @@ fn tools() -> Value {
     ])
 }
 
-fn call(root: &Path, conn: &mut Connection, params: &Value) -> Result<Value, (i64, String)> {
+fn call(root: &Path, conn: &mut Connection, changed: &Changed, params: &Value) -> Result<Value, (i64, String)> {
     let name = params["name"].as_str().unwrap_or("");
     if !tools().as_array().unwrap().iter().any(|t| t["name"] == name) {
         return Err((-32602, format!("unknown tool: {name}")));
     }
     // Tool failures go back as content with isError, so the agent can read them.
-    let (text, is_error) = match run(root, conn, name, &params["arguments"]) {
+    let (text, is_error) = match run(root, conn, changed, name, &params["arguments"]) {
         Ok(t) => (t, false),
         Err(e) => (format!("{e:#}"), true),
     };
     Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
 }
 
-fn run(root: &Path, conn: &mut Connection, tool: &str, args: &Value) -> Result<String> {
+fn run(root: &Path, conn: &mut Connection, changed: &Changed, tool: &str, args: &Value) -> Result<String> {
     let arg = |k: &str| args[k].as_str().ok_or_else(|| anyhow!("missing string argument `{k}`"));
     let limit = |d: usize| args["limit"].as_u64().map_or(d, |n| n as usize);
-    // ponytail: O(files) refresh per call (10 ms ripgrep, 175 ms TypeScript); watch mode (phase 5) replaces it
-    index::index(root, conn)?;
+    refresh(root, conn, changed)?;
     match tool {
         "find_def" => query::def(conn, arg("name")?),
         "find_refs" => query::refs(conn, arg("name")?, limit(50)),
@@ -133,8 +191,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("a.rs"), "fn helper() {}\nfn run() { helper(); }\n").unwrap();
         let mut conn = db::open(&root).unwrap();
-        index::index(&root, &mut conn).unwrap();
-        let mut rpc = |s: &str| handle(&root, &mut conn, s);
+        index::index(&root, &mut conn, None).unwrap();
+        let changed: Changed = Arc::new(Mutex::new(Some(HashSet::new())));
+        let mut rpc = |s: &str| handle(&root, &mut conn, &changed, s);
 
         let init = rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#).unwrap();
         assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
@@ -154,5 +213,41 @@ mod tests {
         assert_eq!(unknown["error"]["code"], -32602);
         assert_eq!(rpc("{bad").unwrap()["error"]["code"], -32700);
         assert_eq!(rpc(r#"{"jsonrpc":"2.0","id":7,"method":"x"}"#).unwrap()["error"]["code"], -32601);
+        drop(conn);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn watch_picks_up_edits() {
+        let root = std::env::temp_dir().join(format!("sym-watch-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.rs"), "fn old() {}\n").unwrap();
+        let changed: Changed = Arc::new(Mutex::new(Some(HashSet::new())));
+        let _w = watch(&root, changed.clone()).unwrap();
+        let mut conn = db::open(&root).unwrap();
+        index::index(&root, &mut conn, None).unwrap();
+        refresh(&root, &mut conn, &changed).unwrap(); // drain events from the initial writes
+
+        let edit = |f: &dyn Fn()| {
+            let t = std::time::Instant::now();
+            f();
+            while changed.lock().unwrap().as_ref().is_some_and(|s| s.is_empty()) {
+                assert!(t.elapsed().as_secs() < 5, "no watch event");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        edit(&|| fs::write(root.join("src/a.rs"), "fn fresh() {}\n").unwrap());
+        refresh(&root, &mut conn, &changed).unwrap();
+        assert_eq!(query::def(&conn, "fresh").unwrap(), "src/a.rs:1-1 function fn fresh()\n");
+        assert!(query::def(&conn, "old").unwrap().starts_with("no definition"));
+
+        // A deleted directory takes its files with it.
+        edit(&|| fs::remove_dir_all(root.join("src")).unwrap());
+        refresh(&root, &mut conn, &changed).unwrap();
+        assert!(query::def(&conn, "fresh").unwrap().starts_with("no definition"));
+
+        drop(conn);
+        let _ = fs::remove_dir_all(&root);
     }
 }
