@@ -24,7 +24,7 @@ query latency, and tokens per task versus `rg`.
 | Decision | Choice | Why | Revisit when |
 |---|---|---|---|
 | Language | Rust (edition 2024) | tree-sitter, rayon and notify are first-class; single binary | — |
-| Parsing | `tree-sitter` 0.27 `Query`/`QueryCursor` running each grammar's `tags.scm` + our extras; `tree-sitter-tags` dropped | same queries, but we keep the syntax tree: syntax-aware signatures, parents, qualifiers, and (phase 5) incremental re-parse. One tag per name node: defs beat refs, then earliest pattern | — |
+| Parsing | `tree-sitter` 0.27 `Query`/`QueryCursor` running each grammar's `tags.scm` + our extras; `tree-sitter-tags` dropped | same queries, but we keep the syntax tree: syntax-aware signatures, parents, qualifiers, and (if ever needed) incremental re-parse. One tag per name node: defs beat refs, then earliest pattern | — |
 | Languages | Rust, Python, JS/JSX, TS/TSX, Go | cover most agent workloads | users ask for more (add grammar + extra query in `lang.rs`) |
 | Imports | extra `@reference.import` patterns inside the tags query | same single parse, no second pass | — |
 | Signatures | def text up to its `body` field (or the body of the function in its `value`/`right`); body-less defs scan tokens to a top-level `{`/`;` (Python `:`) or past `=>`. Strings/comments are atomic, strings > 40 B print as `"..."`; 200 chars max | syntax-aware, no per-language code | a grammar with no `body` field gives odd headers |
@@ -34,7 +34,7 @@ query latency, and tokens per task versus `rg`.
 | Rejected storage | Sled (stalled), RocksDB (heavy C++ build, KV only), DuckDB (OLAP, weak point lookups), GlueSQL (immature) | — | — |
 | Call graph | no edge table; the caller is the innermost def whose line span contains the call ref (indexed `(file_id, line)` lookup) | zero resolution pass | — |
 | CLI freshness | every CLI command runs an incremental refresh before answering | stale answers are the worst failure for an agent; refresh is 10 ms on ripgrep | big repos (175 ms at 31k files) → use `sym serve` (watch mode) |
-| Watch mode | `notify` (no debouncer) callback records changed repo-relative paths in a shared set; each MCP tool call drains it and runs a scoped `index::index` (walk from the root, descending only into ancestors of changed paths, so every `.gitignore` still applies). Watcher error/overflow, or a root ignore-file edit, → full rescan; a nested ignore-file edit → rescan its dir. `.sym`/`.git` and existing unsupported files are dropped at event time | lazy drain means no debounce, no second connection, no locking beyond one mutex; edit → answer 38 ms at 31k files | parse cost of a big edited file must be hidden → eager background re-index thread |
+| Watch mode | `notify` (no debouncer crate) callback records changed repo-relative paths in a shared set and wakes a background thread, which waits for 20 ms of quiet, then runs a scoped `index::index` (walk from the root, descending only into ancestors of changed paths, so every `.gitignore` still applies; stamps looked up per changed path). Each tool call also drains the set first, so nothing pending is missed; the connection is behind one mutex, so a call arriving mid-update waits for it. Watcher error/overflow, or a root ignore-file edit, → full rescan; a nested ignore-file edit → rescan its dir. `.sym`/`.git` and existing unsupported files are dropped at event time | edit cost is paid while the agent thinks: a 1.4 MiB file (~650 ms) is ready 1 s later; small edit → answer 9–19 ms at 66k files | a query right after saving a huge file must be fast → incremental re-parse (see Known limits) |
 | Output format | plain text, one line per hit, `path:line-end kind [in Parent:] sig`; refs/calls grouped per resolved definition, then by file; `?` = ambiguous | fewest tokens; `line-end` lets an agent read the exact span | an MCP client needs structured output |
 | Root discovery | `--root`, else nearest ancestor with `.sym` or `.git`, else cwd | works from any subdir | — |
 | Reference resolution | syntactic, at query time (`query.rs` `Resolver`). Defs store `parent` (enclosing class/interface/impl, Go receiver), refs store `qual` (receiver/qualifier). Same language family only. Bare `f()` → free defs; `self.f()` → caller's own type; `Q.f()` → type `Q`, else a type ending in `Q` (`searcher` → `Searcher`), else module `Q`; capitalized/`::` `Q` with no match → external. Ties: same file → best import path match → same dir. TS overloads merge into one target | no types needed, one pass per query; fixed ripgrep's two `search_path`s and all 388 `getTypeOfSymbol` call sites on TypeScript | a receiver name says nothing about its type (`x.run()` with many `run` methods stays `?`) → per-language type inference |
@@ -59,7 +59,7 @@ query latency, and tokens per task versus `rg`.
 | 2 | `db.rs` + `index.rs`: SQLite store, full + incremental index | second `sym index` re-parses 0 files | ✅ done |
 | 3 | CLI: `def`, `refs`, `search`, `calls`, `outline` (clap) | correct answers on this repo and on ripgrep | ✅ done |
 | 4 | `sym serve` MCP server, 5 tools | works via `claude mcp add sym -- sym serve` | ✅ done (stdio smoke-tested; not yet run inside Claude Code) |
-| 5 | Watch mode (`notify` inside `serve`, applied lazily per tool call) | an edit shows up in queries in < 100 ms | ✅ done (38–42 ms write → answer on TypeScript) |
+| 5 | Watch mode (`notify` + background re-index thread inside `serve`) | an edit shows up in queries in < 100 ms | ✅ done (9–19 ms write → answer on TypeScript) |
 | 6 | Benchmarks + README | published numbers vs `rg` | ⏳ next |
 
 MCP tools: `find_def(name)`, `find_refs(name, limit?)`, `search(query, limit?)`,
@@ -70,7 +70,7 @@ MCP tools: `find_def(name)`, `find_refs(name, limit?)`, `search(query, limit?)`,
 - `src/lang.rs`: `parse(path, src) -> Option<Parsed { defs, refs, imports }>`, `supported(path)`, `family(path)`.
   Static `LANGS` table with lazily compiled `Query`s, and one `(Parser, QueryCursor)` per thread.
   `Def { name, kind, line, end_line, sig, parent }`, `Ref { name, kind, line, qual }`.
-- `src/db.rs`: `open(root)`, `known_files`, `put_file` (delete + insert, cascading), `remove_file`. Schema version 2.
+- `src/db.rs`: `open(root)`, `known_files`, `known_under(prefix)` (range scan on the path index), `put_file` (delete + insert, cascading), `remove_file`. Schema version 2.
   Tables: `files`, `symbols(name, kind, line, end_line, sig, parent)`, `refs(name, kind, line, qual)`, `imports(module)`.
   Indexes on `name`/`module` and on `(file_id, line)`.
 - `src/index.rs`: `index(root, conn, changed: Option<&HashSet<String>>) -> Stats { parsed, unchanged, removed, failed }`;
@@ -81,8 +81,9 @@ MCP tools: `find_def(name)`, `find_refs(name, limit?)`, `search(query, limit?)`,
 - `src/main.rs`: clap CLI: `sym [--root R] index|def NAME|refs NAME|search Q|calls NAME [--callees]|outline PATH`.
   Every command refreshes the index first. `outline` accepts a path relative to cwd, or a suffix such as `db.rs`.
 - `src/mcp.rs`: `sym serve`. Reads JSON-RPC lines from stdin, handles `initialize`/`ping`/`tools/list`/`tools/call`,
-  ignores notifications. Keeps one connection open. `watch` (notify) fills a `Changed` set; each tool call runs
-  `refresh` (scoped `index::index` over the drained set, nothing if empty) then the matching `query` fn.
+  ignores notifications. One connection behind a mutex. `watch` (notify) fills a `Changed` set and wakes a background
+  thread that runs `refresh` (scoped `index::index` over the drained set, nothing if empty) after `SETTLE` (20 ms);
+  each tool call runs `refresh` too, then the matching `query` fn.
 - Index location: `.sym/index.db` at the repo root (gitignored).
 
 Benchmarks (release, Windows, 16 threads, warm OS cache):
@@ -93,7 +94,9 @@ Benchmarks (release, Windows, 16 threads, warm OS cache):
 | TypeScript (microsoft) | 31,443 | 5.9 s | 175 ms | 1.1 s (3 MiB `checker.ts`) | 63 MB |
 
 `sym serve` on TypeScript (66,684 files in the clone): tool call with no pending changes 0.2 ms; write a new
-file → `find_def` answer 38–42 ms (102 ms first time, cold); delete → 29 ms.
+file → `find_def` answer 9–19 ms; delete → 10 ms. Big-file edit (`checker.go` 1.4 MiB / `lib.dom.d.ts` 2.3 MiB):
+query sent at once waits 620–680 / 420–490 ms; sent 1 s later, 0 ms (already re-indexed in the background).
+That ~650 ms splits into tree-sitter parse ≈ 220 ms, tag query + extraction ≈ 140 ms, SQLite delete + insert ≈ 250 ms.
 
 Warm refresh breakdown on TypeScript (66,684 files in 653 dirs): directory walk ≈ 70 ms, root `.gitignore`
 matching ≈ 50 ms, global excludes ≈ 35 ms, `known_files` ≈ 17 ms, DB open 2 ms.
@@ -116,14 +119,14 @@ Known limits (also marked `ponytail:` in the code):
 - Resolution is syntactic, not type-based: `x.run()` with several project `run` methods and an
   uninformative receiver name is shown under each with `?`.
 - Minified files: symbols in the first 1000 columns of a minified line still get indexed (bounded junk).
-- Huge files are bound by tree-sitter itself: `checker.ts` (3 MiB) takes ~1 s to re-index after an edit.
-  Fix: incremental re-parse with the retained old tree inside `serve` (not done in phase 5; watch mode re-parses
-  changed files from scratch). A CLI call can't keep trees.
+- Huge files re-index whole: a 1.4 MiB edit costs ~650 ms (1.1 s for 3 MiB `checker.ts`). `serve` hides it in the
+  background, so only a query sent within that window waits; the CLI always pays it. Incremental re-parse with a
+  retained tree would only cut the parse third (≈ 220 ms); the rest is tag extraction and rewriting the file's rows.
+  Full fix, if ever needed: retained trees + re-extract/rewrite only the changed range.
 - Warm refresh is O(files) (175 ms at 31k files), and every CLI query pays it. The walk itself is the floor
   (≈ 70 ms raw `read_dir` on Windows); `sym serve` avoids it via watch mode.
-- Watch mode: a scoped update still loads every known file's stamp (~17 ms at 31k files) before filtering; an event the OS
-  hasn't delivered when a tool call starts is picked up by the next call (not observed in practice: write-then-query caught it).
-  The changed file is parsed during the tool call, so editing `checker.ts` makes the next call ~1 s.
+- Watch mode: an event the OS hasn't delivered when a tool call starts is picked up by the next call (not observed:
+  write-then-query caught it every time).
 - `refs`/`calls` resolve every reference of the name (18 ms for ~500 refs); a name with 100k refs costs
   proportionally. Fine until measured otherwise.
 - Anonymous callbacks without a string argument (`setTimeout(() => ..)`, `arr.map(x => ..)` at top level) still
@@ -131,6 +134,7 @@ Known limits (also marked `ponytail:` in the code):
 
 ## Changelog
 
+- 2026-09-28: Watch-mode limits fixed before phase 6. Background re-index thread (20 ms settle, conn behind a mutex) so edit cost is paid before the next tool call: 1.4 MiB edit answered in 0 ms after 1 s (was ~650 ms on the call). Scoped updates look up stamps per changed path (`db::known_under`) instead of loading all: small edit → answer 38–42 → 9–19 ms. Measured big-file breakdown; incremental re-parse deferred (saves ≤ 1/3).
 - 2026-09-28: Phase 5 done. Watch mode in `sym serve`: `notify` (adds dep; skipped `notify-debouncer-mini`, lazy drain makes debounce moot) records changed paths, each tool call runs a scoped `index::index` (new `changed` arg). TypeScript: no-change call 175 → 0.2 ms, edit → answer 38–42 ms. Tests: scoped index + real watcher (edit, dir delete).
 - 2026-09-28: Phase 4 done. `sym serve`: sync stdio MCP server (`mcp.rs`, adds `serde_json`) with the 5 tools wrapping `query.rs`, refresh per call. Protocol test + stdio smoke test pass; not yet exercised inside Claude Code.
 - 2026-09-28: Fixed phase 3 known limits before phase 4. Replaced `tree-sitter-tags` with direct `Query` use (keeps the tree); syntax-aware signatures; `parent`/`qual` columns (schema v2) and a syntactic resolver for refs/calls/callees; TS overloads merged; JS/Go callback defs; Rust `impl` defs; column-based minified filter replaces the whole-file heuristic; nucleo + initials ranking in `search`; `parents(false)` at repo roots. TypeScript: cold 7.0 → 5.9 s, warm 310 → 175 ms, `calls getTypeOfSymbol` 0 ambiguous of 388.

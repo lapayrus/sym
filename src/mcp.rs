@@ -1,11 +1,13 @@
 //! `sym serve`: MCP server over stdio. Newline-delimited JSON-RPC 2.0, synchronous,
-//! one request at a time. A file watcher records changed paths; each tool call re-indexes
-//! just those, then wraps a `query` fn.
+//! one request at a time. A file watcher records changed paths and a background thread
+//! re-indexes just those; each tool call first applies anything still pending, then wraps a `query` fn.
 
 use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -17,19 +19,36 @@ use crate::{db, index, lang, query};
 /// Repo-relative paths changed since the last refresh; `None` = watcher lost track, rescan everything.
 type Changed = Arc<Mutex<Option<HashSet<String>>>>;
 
+/// Quiet time before the background thread re-indexes, so a burst (save, `git checkout`) is one update.
+const SETTLE: Duration = Duration::from_millis(20);
+
 pub fn serve(root: &Path) -> Result<()> {
     let changed: Changed = Arc::new(Mutex::new(Some(HashSet::new())));
+    let (wake, woken) = channel();
     // Watch before the first index so no edit falls in between.
-    let _watcher = watch(root, changed.clone())?;
-    let mut conn = db::open(root)?;
-    index::index(root, &mut conn, None)?;
+    let _watcher = watch(root, changed.clone(), wake)?;
+    let conn = Arc::new(Mutex::new(db::open(root)?));
+    index::index(root, &mut conn.lock().unwrap(), None)?;
+
+    // Re-index as edits land, so the parse cost (~650 ms for a 1.4 MiB file) is usually paid before
+    // the agent's next tool call; a call arriving mid-update waits on the lock and still sees it.
+    let (bg_root, bg_conn, bg_changed) = (root.to_path_buf(), conn.clone(), changed.clone());
+    std::thread::spawn(move || {
+        while woken.recv().is_ok() {
+            while woken.recv_timeout(SETTLE).is_ok() {}
+            if let Err(e) = refresh(&bg_root, &mut bg_conn.lock().unwrap(), &bg_changed) {
+                eprintln!("sym: {e:#}");
+            }
+        }
+    });
+
     let mut out = std::io::stdout().lock();
     for line in std::io::stdin().lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(resp) = handle(root, &mut conn, &changed, &line) {
+        if let Some(resp) = handle(root, &mut conn.lock().unwrap(), &changed, &line) {
             writeln!(out, "{resp}")?;
             out.flush()?;
         }
@@ -37,14 +56,18 @@ pub fn serve(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Record OS file events in `changed`. Queries apply them lazily, so no debounce is needed.
-fn watch(root: &Path, changed: Changed) -> Result<notify::RecommendedWatcher> {
+/// Record OS file events in `changed` and poke `wake` when something was recorded.
+fn watch(root: &Path, changed: Changed, wake: Sender<()>) -> Result<notify::RecommendedWatcher> {
     let base = root.to_path_buf();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let mut c = changed.lock().unwrap();
         let ev = match res {
             Ok(ev) if !ev.need_rescan() => ev,
-            _ => return *c = None, // event overflow or watcher error
+            _ => {
+                *c = None; // event overflow or watcher error
+                let _ = wake.send(());
+                return;
+            }
         };
         if matches!(ev.kind, EventKind::Access(_)) {
             return; // our own reads
@@ -66,6 +89,7 @@ fn watch(root: &Path, changed: Changed) -> Result<notify::RecommendedWatcher> {
                 Some(set) if !rel.is_empty() => _ = set.insert(rel),
                 _ => *c = None,
             }
+            let _ = wake.send(()); // receiver gone = shutting down
         }
     })?;
     watcher.watch(root, RecursiveMode::Recursive)?;
@@ -73,7 +97,7 @@ fn watch(root: &Path, changed: Changed) -> Result<notify::RecommendedWatcher> {
 }
 
 /// Re-index what changed since the last call (the whole tree if the watcher lost track).
-/// ponytail: an event not yet delivered when the query runs is missed until the next call (OS latency is ~ms); fine for agents
+/// ponytail: an event the OS hasn't delivered when a query runs is picked up by the next call (latency is ~ms); fine for agents
 fn refresh(root: &Path, conn: &mut Connection, changed: &Changed) -> Result<()> {
     let taken = changed.lock().unwrap().replace(HashSet::new());
     let res = match &taken {
@@ -224,7 +248,8 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/a.rs"), "fn old() {}\n").unwrap();
         let changed: Changed = Arc::new(Mutex::new(Some(HashSet::new())));
-        let _w = watch(&root, changed.clone()).unwrap();
+        let (wake, woken) = channel();
+        let _w = watch(&root, changed.clone(), wake).unwrap();
         let mut conn = db::open(&root).unwrap();
         index::index(&root, &mut conn, None).unwrap();
         refresh(&root, &mut conn, &changed).unwrap(); // drain events from the initial writes
@@ -238,6 +263,7 @@ mod tests {
             }
         };
         edit(&|| fs::write(root.join("src/a.rs"), "fn fresh() {}\n").unwrap());
+        assert!(woken.try_recv().is_ok(), "recorded events wake the background thread");
         refresh(&root, &mut conn, &changed).unwrap();
         assert_eq!(query::def(&conn, "fresh").unwrap(), "src/a.rs:1-1 function fn fresh()\n");
         assert!(query::def(&conn, "old").unwrap().starts_with("no definition"));

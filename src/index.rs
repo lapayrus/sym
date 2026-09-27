@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
 use std::path::Path;
 use std::sync::mpsc;
@@ -43,11 +43,17 @@ fn covered(changed: &HashSet<String>, rel: &str) -> bool {
 /// `changed` (watch mode) limits the run to those repo-relative files/dirs; `None` checks the whole tree.
 /// Change detection is `(mtime, size)`; everything happens in one transaction.
 pub fn index(root: &Path, conn: &mut Connection, changed: Option<&HashSet<String>>) -> Result<Stats> {
-    let mut known = db::known_files(conn)?;
-    // ponytail: loads every known file even for a one-file update (~17 ms at 31k files); per-path lookup if it shows up
-    if let Some(c) = changed {
-        known.retain(|rel, _| covered(c, rel));
-    }
+    let mut known = match changed {
+        None => db::known_files(conn)?,
+        Some(c) => {
+            let mut k = HashMap::new();
+            for p in c {
+                k.extend(db::known_under(conn, p)?);
+            }
+            k.retain(|rel, _| covered(c, rel));
+            k
+        }
+    };
     let mut stats = Stats::default();
     let mut todo = Vec::new();
 
@@ -182,6 +188,8 @@ mod tests {
         let only = |ps: &[&str]| ps.iter().map(|p| p.to_string()).collect::<HashSet<_>>();
         assert_eq!(index(&root, &mut conn, Some(&only(&["new.py", "gen/y.rs"]))).unwrap(), s(1, 0, 0));
         assert_eq!(count(&conn, "SELECT count(*) FROM symbols WHERE name = 'a4'"), 0);
+        // `app` range-matches `app.min.js` in the db but doesn't cover it: not removed.
+        assert_eq!(index(&root, &mut conn, Some(&only(&["app"]))).unwrap(), s(0, 0, 0));
         assert_eq!(index(&root, &mut conn, Some(&only(&["src"]))).unwrap(), s(1, 0, 0));
         assert_eq!(count(&conn, "SELECT count(*) FROM symbols WHERE name = 'a4'"), 1);
         fs::remove_dir_all(root.join("src")).unwrap();

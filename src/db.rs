@@ -74,6 +74,14 @@ pub fn known_files(conn: &Connection) -> Result<HashMap<String, (i64, i64)>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Like `known_files`, but only paths in `[prefix, prefix + '0')`: `prefix` itself, files under
+/// `prefix/`, and siblings such as `prefix.rs` (`-`, `.` sort before `/`) that the caller filters out.
+pub fn known_under(conn: &Connection, prefix: &str) -> Result<HashMap<String, (i64, i64)>> {
+    let mut stmt = conn.prepare_cached("SELECT path, mtime, size FROM files WHERE path >= ?1 AND path < ?1 || '0'")?;
+    let rows = stmt.query_map([prefix], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn remove_file(tx: &Transaction, path: &str) -> Result<()> {
     tx.prepare_cached("DELETE FROM files WHERE path = ?1")?.execute([path])?;
     Ok(())
