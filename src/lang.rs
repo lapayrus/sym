@@ -22,9 +22,9 @@ const PYTHON_EXTRA: &str = r#"
 const JS_EXTRA: &str = r#"
 (import_statement source: (string (string_fragment) @name)) @reference.import
 (export_statement source: (string (string_fragment) @name)) @reference.import
+((call_expression function: (identifier) arguments: (arguments . (string (string_fragment) @name))) @reference.import
+  (#match? @reference.import "^require\\s*\\("))
 "#;
-// ponytail: CommonJS require() imports not indexed; tags queries reject the extra capture a
-// #eq? on the callee needs. Add by scanning `require` call refs' first arg if CJS repos matter.
 const GO_EXTRA: &str = r#"
 (import_spec path: (_) @name) @reference.import
 "#;
@@ -38,6 +38,29 @@ fn lang(exts: &'static [&'static str], language: tree_sitter::Language, queries:
     let cfg = TagsConfiguration::new(language, &queries.concat(), "")
         .unwrap_or_else(|e| panic!("bad tags query for {exts:?}: {e}"));
     Lang { exts, cfg }
+}
+
+/// Definition header: text from the def's start up to its body, whitespace collapsed.
+/// Stops at `{`/`;` (Python: `:`) outside brackets, or just after a top-level `=>`.
+// ponytail: byte scan, not syntax-aware; a bracket inside a string before the body can skew it
+fn signature(def: &[u8], python: bool) -> String {
+    let mut depth = 0i32;
+    let mut stop = def.len();
+    for (i, &b) in def.iter().enumerate() {
+        match b {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'{' if depth == 0 && !python => { stop = i; break }
+            b'{' => depth += 1,
+            b';' if depth == 0 && !python => { stop = i; break }
+            b':' if depth == 0 && python => { stop = i; break }
+            b'=' if depth == 0 && def.get(i + 1) == Some(&b'>') => { stop = i + 2; break }
+            _ => {}
+        }
+    }
+    let text = String::from_utf8_lossy(&def[..stop]);
+    let sig = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    sig.chars().take(200).collect()
 }
 
 static LANGS: LazyLock<Vec<Lang>> = LazyLock::new(|| {
@@ -102,8 +125,7 @@ pub fn parse(path: &Path, src: &[u8]) -> Result<Option<Parsed>> {
             let name = text(tag.name_range.clone());
             let line = tag.span.start.row as u32 + 1;
             if tag.is_definition {
-                // ponytail: signature is the name's line only; multi-line signatures get cut
-                let sig: String = text(tag.line_range.clone()).trim().chars().take(160).collect();
+                let sig = signature(&src[tag.range.clone()], lang.exts[0] == "py");
                 out.defs.push(Def { name, kind, line, end_line: line_of(tag.range.end), sig });
             } else if kind == "import" {
                 out.imports.push(name.trim_matches(['"', '`']).to_string());
@@ -126,6 +148,9 @@ mod tests {
     fn defs(p: &Parsed) -> Vec<(&str, &str, u32, u32)> {
         p.defs.iter().map(|d| (d.name.as_str(), d.kind, d.line, d.end_line)).collect()
     }
+    fn sig<'a>(p: &'a Parsed, name: &str) -> &'a str {
+        &p.defs.iter().find(|d| d.name == name).unwrap().sig
+    }
     fn refs(p: &Parsed) -> Vec<(&str, u32)> {
         p.refs.iter().filter(|r| r.kind == "call").map(|r| (r.name.as_str(), r.line)).collect()
     }
@@ -137,7 +162,7 @@ mod tests {
 
     #[test]
     fn rust() {
-        let r = p("a.rs", "use std::path::Path;\nconst MAX: u32 = 3;\nstruct Db;\nimpl Db {\n    fn open() -> Self {\n        helper();\n        Db\n    }\n}\nfn helper() { Db::open(); x.run(); }\ntrait T { fn sig(&self); }\n");
+        let r = p("a.rs", "use std::path::Path;\nconst MAX: u32 = 3;\nstruct Db;\nimpl Db {\n    fn open() -> Self {\n        helper();\n        Db\n    }\n}\nfn helper() { Db::open(); x.run(); }\ntrait T { fn sig(&self); }\npub fn long<T>(\n    a: u32,\n    b: [u8; 2],\n) -> T\nwhere\n    T: Default,\n{\n    T::default()\n}\n");
         assert_eq!(r.imports, ["std::path::Path"]);
         let d = defs(&r);
         assert!(d.contains(&("MAX", "constant", 2, 2)));
@@ -145,25 +170,33 @@ mod tests {
         assert!(d.contains(&("open", "method", 5, 8)));
         assert!(d.contains(&("helper", "function", 10, 10)));
         assert!(d.contains(&("sig", "method", 11, 11)));
-        assert_eq!(refs(&r), [("helper", 6), ("open", 10), ("run", 10)]);
-        assert_eq!(r.defs.iter().find(|d| d.name == "open").unwrap().sig, "fn open() -> Self {");
+        assert_eq!(refs(&r), [("helper", 6), ("open", 10), ("run", 10), ("default", 19)]);
+        assert!(d.contains(&("long", "function", 12, 20)));
+        assert_eq!(sig(&r, "open"), "fn open() -> Self");
+        assert_eq!(sig(&r, "sig"), "fn sig(&self)");
+        assert_eq!(sig(&r, "MAX"), "const MAX: u32 = 3");
+        assert_eq!(sig(&r, "long"), "pub fn long<T>( a: u32, b: [u8; 2], ) -> T where T: Default,");
     }
 
     #[test]
     fn python() {
-        let r = p("a.py", "import os, a.b as c\nfrom .x import y\nclass K:\n    def m(self):\n        os.path.join()\n\ndef f():\n    K().m()\n");
+        let r = p("a.py", "import os, a.b as c\nfrom .x import y\nclass K:\n    def m(self):\n        os.path.join()\n\ndef f(\n    a: dict = {\"k\": 1},\n) -> list[int]:\n    K().m()\n");
         assert_eq!(r.imports, ["os", "a.b", ".x"]);
         let d = defs(&r);
         assert!(d.contains(&("K", "class", 3, 5)));
         assert!(d.contains(&("m", "function", 4, 5)));
-        assert!(d.contains(&("f", "function", 7, 8)));
-        assert_eq!(refs(&r), [("join", 5), ("K", 8), ("m", 8)]);
+        assert!(d.contains(&("f", "function", 7, 10)));
+        assert_eq!(refs(&r), [("join", 5), ("K", 10), ("m", 10)]);
+        assert_eq!(sig(&r, "K"), "class K");
+        assert_eq!(sig(&r, "f"), "def f( a: dict = {\"k\": 1}, ) -> list[int]");
     }
 
     #[test]
     fn javascript() {
         let r = p("a.js", "import x from './x';\nconst fs = require('fs');\nclass A { run() { go(); } }\nconst go = () => fs.read();\n");
-        assert_eq!(r.imports, ["./x"]);
+        assert_eq!(r.imports, ["./x", "fs"]);
+        assert_eq!(sig(&r, "go"), "go = () =>");
+        assert_eq!(sig(&r, "run"), "run()");
         let d = defs(&r);
         assert!(d.contains(&("A", "class", 3, 3)));
         assert!(d.contains(&("run", "method", 3, 3)));
@@ -181,6 +214,7 @@ mod tests {
             assert!(d.contains(&("m", "method", 2, 2)), "{file}");
             assert!(d.contains(&("f", "function", 3, 5)), "{file}");
             assert_eq!(refs(&r), [("y", 4)]);
+            assert_eq!(sig(&r, "f"), "function f(a: I): number");
         }
     }
 
@@ -193,6 +227,7 @@ mod tests {
         assert!(d.contains(&("M", "method", 10, 10)));
         assert!(d.contains(&("main", "function", 12, 14)));
         assert_eq!(refs(&r), [("Println", 10), ("M", 13)]);
+        assert_eq!(sig(&r, "M"), "func (s S) M()");
     }
 
     #[test]
