@@ -45,7 +45,7 @@ query latency, and tokens per task versus `rg`.
 | Query compile | per-language `OnceLock`, compiled on first use | startup cost only for languages present | — |
 | File filter | `.gitignore` respected even outside git (`require_git(false)`); ignore files above a repo root skipped (`parents(false)` when root has `.git`); hard cap 16 MiB | real sources reach 3 MiB; parent lookup cost 50 ms/refresh on TypeScript | — |
 | Minified code | every file is parsed; symbols whose name starts past column 1000 are dropped | no whole-file heuristic to misfire (a normal file with one huge data line keeps its symbols) | the ≤ 1000-column junk from a bundle's first line bothers anyone |
-| MCP transport | hand-rolled sync stdio JSON-RPC | about 100 lines, no tokio | HTTP transport needed → `rmcp` |
+| MCP transport | hand-rolled sync stdio JSON-RPC (`mcp.rs`, newline-delimited, `serde_json` only); `initialize` echoes the client's protocol version; tool failures return `isError` content, unknown tools/methods return JSON-RPC errors | about 100 lines, no tokio, no `rmcp` | HTTP transport or concurrent requests needed → `rmcp`; a client needs a newer protocol feature → pin versions |
 | Fuzzy search | SQL `LIKE '%a%b%'` prefilter (case-insensitive subsequence, `_`/`%` escaped) over distinct non-callback names, then ranked: exact word initials (`gtos` → `getTypeOfSymbol`) → `nucleo-matcher` score → shorter | boundary/camelCase-aware ranking, 24–59 ms at 31k files | too slow → in-memory name list in `serve` |
 | Rejected: Laya (Convai decision model) | not used | a probabilistic classifier, ~140 ms+/call on CPU, 1.7 GB, 512-token context; conflicts with the "fast, exact, light" pitch | — |
 
@@ -57,12 +57,12 @@ query latency, and tokens per task versus `rg`.
 | 1 | `lang.rs`: defs/refs/imports + signatures, 5 languages | per-language tests pass | ✅ done |
 | 2 | `db.rs` + `index.rs`: SQLite store, full + incremental index | second `sym index` re-parses 0 files | ✅ done |
 | 3 | CLI: `def`, `refs`, `search`, `calls`, `outline` (clap) | correct answers on this repo and on ripgrep | ✅ done |
-| 4 | `sym serve` MCP server, 5 tools | works via `claude mcp add sym -- sym serve` | ⏳ next |
-| 5 | Watch mode (`notify-debouncer-mini`, thread inside `serve`) | an edit shows up in queries in < 100 ms | ⏳ |
+| 4 | `sym serve` MCP server, 5 tools | works via `claude mcp add sym -- sym serve` | ✅ done (stdio smoke-tested; not yet run inside Claude Code) |
+| 5 | Watch mode (`notify-debouncer-mini`, thread inside `serve`) | an edit shows up in queries in < 100 ms | ⏳ next |
 | 6 | Benchmarks + README | published numbers vs `rg` | ⏳ |
 
-MCP tools planned: `find_def(name)`, `find_refs(name, limit)`, `search(query)`,
-`calls(name, callers|callees)`, `outline(path)`.
+MCP tools: `find_def(name)`, `find_refs(name, limit?)`, `search(query, limit?)`,
+`calls(name, direction? = callers|callees, limit?)`, `outline(path)`.
 
 ## Current state
 
@@ -78,6 +78,8 @@ MCP tools planned: `find_def(name)`, `find_refs(name, limit)`, `search(query)`,
   `callees` lists resolved callees with locations, then `external: ...`.
 - `src/main.rs`: clap CLI: `sym [--root R] index|def NAME|refs NAME|search Q|calls NAME [--callees]|outline PATH`.
   Every command refreshes the index first. `outline` accepts a path relative to cwd, or a suffix such as `db.rs`.
+- `src/mcp.rs`: `sym serve`. Reads JSON-RPC lines from stdin, handles `initialize`/`ping`/`tools/list`/`tools/call`,
+  ignores notifications. Keeps one connection open; each tool call runs `index::index` then the matching `query` fn.
 - Index location: `.sym/index.db` at the repo root (gitignored).
 
 Benchmarks (release, Windows, 16 threads, warm OS cache):
@@ -111,7 +113,7 @@ Known limits (also marked `ponytail:` in the code):
 - Huge files are bound by tree-sitter itself: `checker.ts` (3 MiB) takes ~1 s to re-index after an edit.
   Fix: incremental re-parse with the retained old tree, in watch mode (phase 5). Needs a long-lived process;
   a CLI call can't keep trees.
-- Warm refresh is O(files) (175 ms at 31k files), and every CLI query pays it. The walk itself is the floor
+- Warm refresh is O(files) (175 ms at 31k files), and every CLI query and MCP tool call pays it. The walk itself is the floor
   (≈ 70 ms raw `read_dir` on Windows); only watch mode (phase 5) removes it.
 - `refs`/`calls` resolve every reference of the name (18 ms for ~500 refs); a name with 100k refs costs
   proportionally. Fine until measured otherwise.
@@ -120,6 +122,7 @@ Known limits (also marked `ponytail:` in the code):
 
 ## Changelog
 
+- 2026-09-28: Phase 4 done. `sym serve`: sync stdio MCP server (`mcp.rs`, adds `serde_json`) with the 5 tools wrapping `query.rs`, refresh per call. Protocol test + stdio smoke test pass; not yet exercised inside Claude Code.
 - 2026-09-28: Fixed phase 3 known limits before phase 4. Replaced `tree-sitter-tags` with direct `Query` use (keeps the tree); syntax-aware signatures; `parent`/`qual` columns (schema v2) and a syntactic resolver for refs/calls/callees; TS overloads merged; JS/Go callback defs; Rust `impl` defs; column-based minified filter replaces the whole-file heuristic; nucleo + initials ranking in `search`; `parents(false)` at repo roots. TypeScript: cold 7.0 → 5.9 s, warm 310 → 175 ms, `calls getTypeOfSymbol` 0 ambiguous of 388.
 - 2026-09-28: Phase 3 done. clap CLI with `def`/`refs`/`search`/`calls`/`outline` in `query.rs`; auto-refresh before each query; root discovery. Verified on this repo and ripgrep (`calls search_path` matches all 8 `rg` call sites). Queries run in 0.4–42 ms on TypeScript.
 - 2026-09-28: Phase 2 done. SQLite store + incremental index with parallel walk, pipelined parse/write, lazy query compile, and minified-file detection. Cold index of TypeScript went from 9.6 s to 7.0 s; warm refresh from 720 ms to 310 ms.

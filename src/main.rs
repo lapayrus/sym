@@ -1,6 +1,7 @@
 mod db;
 mod index;
 mod lang;
+mod mcp;
 mod query;
 
 use std::path::{Path, PathBuf};
@@ -47,6 +48,8 @@ enum Cmd {
     },
     /// Definitions in a file, nested (PATH may be a suffix like `db.rs`)
     Outline { path: String },
+    /// Run as an MCP server on stdio (`claude mcp add sym -- sym serve`)
+    Serve,
 }
 
 fn find_root() -> PathBuf {
@@ -67,6 +70,9 @@ fn rel_path(root: &Path, path: &str) -> String {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let root = cli.root.unwrap_or_else(find_root);
+    if let Cmd::Serve = cli.cmd {
+        return mcp::serve(&root);
+    }
     let t = Instant::now();
     let mut conn = db::open(&root)?;
     // Every query refreshes first so answers are never stale.
@@ -83,6 +89,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Calls { name, callees: false, limit } => query::callers(&conn, &name, limit)?,
         Cmd::Calls { name, callees: true, limit } => query::callees(&conn, &name, limit)?,
         Cmd::Outline { path } => query::outline(&conn, &rel_path(&root, &path))?,
+        Cmd::Serve => unreachable!("handled above"),
     };
     print!("{out}");
     Ok(())

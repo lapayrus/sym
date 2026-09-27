@@ -553,6 +553,7 @@ dependencies = [
  "nucleo-matcher",
  "rayon",
  "rusqlite",
+ "serde_json",
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-javascript",
