@@ -1,7 +1,20 @@
 [package]
 name = "sym"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+rust-version = "1.90"
+description = "Always-fresh tree-sitter symbol index for AI coding agents: CLI and MCP server"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lapayrus/sym"
+readme = "README.md"
+keywords = ["tree-sitter", "mcp", "symbols", "code-search", "ai"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["bench/", "docs/", ".github/", "CLAUDE.md"]
+# The crates.io name `sym` belongs to another project; releases ship as GitHub binaries.
+publish = false
+
+[profile.release]
+strip = true
 
 [dependencies]
 anyhow = "1.0.104"

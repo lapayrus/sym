@@ -1,0 +1,39 @@
+name: Bug report
+description: Wrong, missing or stale results, crashes, or MCP problems
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: sym version
+      description: Output of `sym --version`
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: e.g. macOS 15 arm64, Ubuntu 24.04, Windows 11
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: How were you using sym?
+      options: [CLI, MCP (Claude Code), MCP (other client)]
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: What you ran and what you got
+      description: The command or tool call, its full output, and the language(s) involved. A public repo and commit that reproduces it helps most.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true

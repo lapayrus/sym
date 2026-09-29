@@ -49,6 +49,7 @@ query latency, and tokens per task versus `rg`.
 | Minified code | every file is parsed; symbols whose name starts past column 1000 are dropped | no whole-file heuristic to misfire (a normal file with one huge data line keeps its symbols) | the ≤ 1000-column junk from a bundle's first line bothers anyone |
 | MCP transport | hand-rolled sync stdio JSON-RPC (`mcp.rs`, newline-delimited, `serde_json` only); `initialize` echoes the client's protocol version and sends `instructions` (when to prefer sym over grep/reading files); tool failures return `isError` content, unknown tools/methods return JSON-RPC errors | about 100 lines, no tokio, no `rmcp` | HTTP transport or concurrent requests needed → `rmcp`; a client needs a newer protocol feature → pin versions |
 | Fuzzy search | SQL `LIKE '%a%b%'` prefilter (case-insensitive subsequence, `_`/`%` escaped) over distinct non-callback names, then ranked: exact word initials (`gtos` → `getTypeOfSymbol`) → `nucleo-matcher` score → shorter | boundary/camelCase-aware ranking, 24–59 ms at 31k files | too slow → in-memory name list in `serve` |
+| Release & CI | GitHub Actions. CI: fmt + clippy `-D warnings` (Linux), `cargo test --locked` on Linux/macOS/Windows, `cargo check` on MSRV 1.90 (set by `tree-sitter`). Release: `v*` tag → tag/`Cargo.toml` version check → 5 targets (Linux gnu x86_64/arm64 on ubuntu-22.04 runners for an older glibc, macOS arm64 + x86_64 cross from arm, Windows msvc) → `gh release create` with archives, `SHA256SUMS`, and the CHANGELOG section as notes. License MIT OR Apache-2.0; repo `lapayrus/sym`; semver starting at 1.0.0 | no third-party release actions beyond checkout/toolchain/cache/artifacts; `gh` is preinstalled | users need musl/static Linux builds, Homebrew, or crates.io (the name `sym` is taken there → publish as another crate name) |
 | Rejected: Laya (Convai decision model) | not used | a probabilistic classifier, ~140 ms+/call on CPU, 1.7 GB, 512-token context; conflicts with the "fast, exact, light" pitch | — |
 
 ## Roadmap
@@ -69,7 +70,7 @@ Post-V1, before the public GitHub release:
 |---|---|---|---|
 | 7 | Type-usage references | `refs Searcher` (Rust) lists `&mut Searcher` / `Searcher::new()` sites | ✅ done |
 | 8 | Dogfood `sym serve` in Claude Code, tune tool descriptions | a real Claude Code session uses the tools correctly | ✅ done (headless `claude -p`, see Changelog) |
-| 9 | Release: versioning, CI, prebuilt binaries, CONTRIBUTING | tag push builds binaries for Linux/macOS/Windows | ⏳ next |
+| 9 | Release: versioning, CI, prebuilt binaries, CONTRIBUTING | tag push builds binaries for Linux/macOS/Windows | ✅ done locally (workflows pass `actionlint`; first real run happens on push to `lapayrus/sym`) |
 
 MCP tools: `find_def(name)`, `find_refs(name, limit?)`, `search(query, limit?)`,
 `calls(name, direction? = callers|callees, limit?)`, `outline(path)`.
@@ -98,6 +99,10 @@ MCP tools: `find_def(name)`, `find_refs(name, limit?)`, `search(query, limit?)`,
   then per-task sym CLI / serve / rg time, lines and ≈ tokens). Wall clock, median of 5 after a warm-up.
   Baselines: rg def regex, `rg -w`, `rg '\bNAME\s*\('`, and reading the whole file for outline.
 - `README.md`: install, MCP setup, CLI sample, benchmark tables, limitations.
+- Release/contribution files: `CHANGELOG.md` (user-facing, Keep a Changelog, **Unreleased** on top), `CONTRIBUTING.md`
+  (setup, design rules, PR flow, adding a language, releasing), `SECURITY.md`, `LICENSE-MIT`/`LICENSE-APACHE`,
+  `.github/` (`ci.yml`, `release.yml`, `dependabot.yml`, issue forms, PR template), `rustfmt.toml` (120 cols),
+  `.gitattributes` (LF).
 
 Benchmarks (release, Windows, 16 threads, warm OS cache):
 
@@ -155,6 +160,7 @@ Known limits (also marked `ponytail:` in the code):
 
 ## Changelog
 
+- 2026-09-29: Phase 9 done locally: version 1.0.0 (`rust-version` 1.90, `publish = false`: crates.io `sym` is someone else's), MIT OR Apache-2.0, CI + release workflows (`actionlint` clean, not yet run on GitHub), Dependabot, CHANGELOG/CONTRIBUTING/SECURITY, issue forms, PR template, rustfmt config, LF `.gitattributes`. Fixed the watcher for macOS (FSEvents reports resolved paths, `/private/var/..`). README timings kept from the pre-1.0 build: a re-run today measured ~2× slower for both sym and rg (machine load), same token counts.
 - 2026-09-29: Phase 8 done. Ran `sym serve` in headless Claude Code (`claude -p --mcp-config .. --strict-mcp-config`) on ripgrep. Told to use sym: 3/3 correct in 5 turns. Not told, with Read/Grep/Glob also allowed: it picked sym by itself. Fixes from the first run: truncation now says `... N more in M files (raise limit to see all)` (the model had guessed a file count from a truncated list; with the hint it re-queried with `limit` and got it right), and `initialize` sends server `instructions`.
 - 2026-09-29: Phase 7 done: type-usage references (schema v3, indexes rebuild on upgrade). ripgrep `refs Searcher`: none → 83 lines over 12 files; refs rows +50% on ripgrep, DB +14% on TypeScript. Added post-V1 phases 7–9 to the roadmap. Note: this machine indexed TypeScript in 18–28 s today with old and new binaries alike (6.9 s yesterday), so compare timings only within one session.
 - 2026-09-28: V1 complete (roadmap phases 0–6). Further work goes in "Next candidates" under Roadmap.

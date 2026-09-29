@@ -1,5 +1,9 @@
 # sym
 
+[![CI](https://github.com/lapayrus/sym/actions/workflows/ci.yml/badge.svg)](https://github.com/lapayrus/sym/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/lapayrus/sym)](https://github.com/lapayrus/sym/releases/latest)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+
 A symbol index for AI coding agents: "ripgrep for symbols". It answers *where is X defined*,
 *who calls X*, *what does this file contain* from a tree-sitter index in SQLite, as a CLI and
 as an MCP server. Answers come back in milliseconds, in compact line-oriented text that costs an agent
@@ -14,11 +18,18 @@ Languages: Rust, Python, JavaScript/JSX, TypeScript/TSX, Go.
 
 ## Install
 
+**Prebuilt binaries:** download the archive for your platform from the
+[latest release](https://github.com/lapayrus/sym/releases/latest). Builds exist for Linux x86_64/arm64, macOS
+arm64/x86_64 and Windows x86_64. Unpack it and put `sym` (or `sym.exe`) on your `PATH`.
+`SHA256SUMS` lists each archive's checksum.
+
+**From source** (Rust 1.90+):
+
 ```sh
-cargo install --path .    # Rust 1.88+
+cargo install --git https://github.com/lapayrus/sym --locked
 ```
 
-Add `.sym/` to your `.gitignore`.
+Then add `.sym/` to your repo's `.gitignore`.
 
 ## Use from Claude Code (MCP)
 
@@ -62,7 +73,9 @@ Calls that could mean several definitions are listed once, under `? one of path:
 
 ## Benchmarks
 
-Measured on Windows 11 with 16 threads and a warm OS cache, against ripgrep 14.1.1.
+Measured on Windows 11 with 16 threads and a warm OS cache, against ripgrep 14.1.1. Timings are from the build just
+before 1.0.0; 1.0.0 adds type-usage references, which grew the TypeScript index from 66 to 75 MB (size shown is
+1.0.0) and left query results for these function symbols unchanged.
 Times are wall clock including process start, as medians. Tokens are estimated as bytes / 4. The rg
 command is what an agent would run instead:
 
@@ -79,7 +92,7 @@ To reproduce: `python bench/bench.py <sym> <rg> <repo> --symbol ... --file ... -
 
 | Cold index | Refresh, no change (CLI) | One-file edit (CLI) | Edit → answer (`serve`) | DB |
 |---|---|---|---|---|
-| 6.9 s | 192 ms | 259 ms | 58 ms | 66 MB |
+| 6.9 s | 192 ms | 259 ms | 58 ms | 75 MB |
 
 | Task | `sym serve` | `sym` CLI | `rg` | ≈ tokens sym / rg |
 |---|---|---|---|---|
@@ -141,3 +154,12 @@ The caller of a reference is the innermost definition whose line span contains i
 - Anonymous callbacks without a name string, such as `arr.map(x => ..)` at top level, have no enclosing definition.
 
 The full list is in [docs/PROJECT.md](docs/PROJECT.md#current-state).
+
+## Contributing
+
+Issues and PRs are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers setup, the design rules, the PR checklist,
+and how to add a language. Release notes are in [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
