@@ -76,7 +76,8 @@ pub fn index(root: &Path, conn: &mut Connection, changed: Option<&HashSet<String
     thread::scope(|s| -> Result<()> {
         s.spawn(|| {
             todo.par_iter().for_each_with(send, |send, (rel, stamp)| {
-                let res = std::fs::read(root.join(rel)).map_err(Into::into).and_then(|src| lang::parse(Path::new(rel), &src));
+                let res =
+                    std::fs::read(root.join(rel)).map_err(Into::into).and_then(|src| lang::parse(Path::new(rel), &src));
                 let _ = send.send((rel, stamp, res)); // receiver gone = writer failed; just drain
             })
         });
@@ -113,9 +114,12 @@ fn walk(root: &Path, changed: Option<&HashSet<String>>) -> Vec<(String, (i64, i6
         // Still walk from the root so every .gitignore on the way applies, but only descend
         // into the ancestors of changed paths.
         let c = c.clone();
-        let dirs: HashSet<String> = c.iter().flat_map(|p| p.match_indices('/').map(|(i, _)| p[..i].to_string())).collect();
+        let dirs: HashSet<String> =
+            c.iter().flat_map(|p| p.match_indices('/').map(|(i, _)| p[..i].to_string())).collect();
         let root = root.to_path_buf();
-        walker.filter_entry(move |e| rel(&root, e.path()).is_some_and(|r| r.is_empty() || dirs.contains(&r) || covered(&c, &r)));
+        walker.filter_entry(move |e| {
+            rel(&root, e.path()).is_some_and(|r| r.is_empty() || dirs.contains(&r) || covered(&c, &r))
+        });
     }
     walker.build_parallel().run(|| {
         let send = send.clone();

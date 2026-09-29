@@ -109,7 +109,11 @@ static LANGS: [Lang; 6] = [
     lang(&["py", "pyi"], || tree_sitter_python::LANGUAGE.into(), &[tree_sitter_python::TAGS_QUERY, PYTHON_EXTRA]),
     lang(&["js", "mjs", "cjs", "jsx"], || js::LANGUAGE.into(), &[js::TAGS_QUERY, JS_EXTRA, JS_ONLY]),
     // TS tags.scm only holds TS-specific patterns; the JS ones apply on top.
-    lang(&["ts", "mts", "cts"], || ts::LANGUAGE_TYPESCRIPT.into(), &[js::TAGS_QUERY, ts::TAGS_QUERY, JS_EXTRA, TS_EXTRA]),
+    lang(
+        &["ts", "mts", "cts"],
+        || ts::LANGUAGE_TYPESCRIPT.into(),
+        &[js::TAGS_QUERY, ts::TAGS_QUERY, JS_EXTRA, TS_EXTRA],
+    ),
     lang(&["tsx"], || ts::LANGUAGE_TSX.into(), &[js::TAGS_QUERY, ts::TAGS_QUERY, JS_EXTRA, TS_EXTRA]),
     lang(&["go"], || tree_sitter_go::LANGUAGE.into(), &[tree_sitter_go::TAGS_QUERY, GO_EXTRA]),
 ];
@@ -228,7 +232,9 @@ fn scan_header(def: Node, python: bool) -> (usize, Vec<Range<usize>>) {
 fn qualifier(name: Node, src: &[u8]) -> Option<String> {
     let p = name.parent()?;
     // `package`: Go `ast.Symbol`; `module`: TS `ns.Type`.
-    let q = ["object", "value", "operand", "path", "package", "module"].into_iter().find_map(|f| p.child_by_field_name(f))?;
+    let q = ["object", "value", "operand", "path", "package", "module"]
+        .into_iter()
+        .find_map(|f| p.child_by_field_name(f))?;
     if q.id() == name.id() {
         return None;
     }
@@ -367,7 +373,10 @@ mod tests {
 
     #[test]
     fn rust() {
-        let r = p("a.rs", "use std::path::Path;\nconst MAX: u32 = 3;\nstruct Db;\nimpl Db {\n    fn open() -> Self {\n        helper();\n        Db\n    }\n}\nfn helper() { Db::open(); x.run(); }\ntrait T { fn sig(&self); }\npub fn long<T>(\n    a: u32,\n    b: [u8; 2],\n) -> T\nwhere\n    T: Default,\n{\n    T::default()\n}\nconst S: &str = \"{\";\nconst Q: &str = \"a long string literal that is not worth showing\";\nimpl<W> fmt::Display for Wrap<W> {}\n");
+        let r = p(
+            "a.rs",
+            "use std::path::Path;\nconst MAX: u32 = 3;\nstruct Db;\nimpl Db {\n    fn open() -> Self {\n        helper();\n        Db\n    }\n}\nfn helper() { Db::open(); x.run(); }\ntrait T { fn sig(&self); }\npub fn long<T>(\n    a: u32,\n    b: [u8; 2],\n) -> T\nwhere\n    T: Default,\n{\n    T::default()\n}\nconst S: &str = \"{\";\nconst Q: &str = \"a long string literal that is not worth showing\";\nimpl<W> fmt::Display for Wrap<W> {}\n",
+        );
         assert_eq!(r.imports, ["std::path::Path"]);
         let d = defs(&r);
         assert!(d.contains(&("MAX", "constant", 2, 2)));
@@ -391,7 +400,10 @@ mod tests {
 
     #[test]
     fn python() {
-        let r = p("a.py", "import os, a.b as c\nfrom .x import y\nclass K:\n    def m(self):\n        os.path.join()\n        def inner(): pass\n\ndef f(\n    a: dict = {\"k\": 1},\n) -> list[int]:\n    K().m()\n    self.m()\n");
+        let r = p(
+            "a.py",
+            "import os, a.b as c\nfrom .x import y\nclass K:\n    def m(self):\n        os.path.join()\n        def inner(): pass\n\ndef f(\n    a: dict = {\"k\": 1},\n) -> list[int]:\n    K().m()\n    self.m()\n",
+        );
         assert_eq!(r.imports, ["os", "a.b", ".x"]);
         let d = defs(&r);
         assert!(d.contains(&("K", "class", 3, 6)));
@@ -406,7 +418,10 @@ mod tests {
 
     #[test]
     fn javascript() {
-        let r = p("a.js", "import x from './x';\nconst fs = require('fs');\nclass A { run() { go(); } }\nconst go = () => fs.read();\ndescribe(\"suite\", () => {\n  it('works', async () => { new ns.Thing(); });\n});\n");
+        let r = p(
+            "a.js",
+            "import x from './x';\nconst fs = require('fs');\nclass A { run() { go(); } }\nconst go = () => fs.read();\ndescribe(\"suite\", () => {\n  it('works', async () => { new ns.Thing(); });\n});\n",
+        );
         assert_eq!(r.imports, ["./x", "fs"]);
         assert_eq!(sig(&r, "go"), "go = () =>");
         assert_eq!(sig(&r, "run"), "run()");
@@ -426,7 +441,10 @@ mod tests {
     #[test]
     fn typescript() {
         for file in ["a.ts", "a.tsx"] {
-            let r = p(file, "import { y } from \"./y\";\ninterface I { m(): void }\nexport function f(a: I): number {\n  return y(a);\n}\n");
+            let r = p(
+                file,
+                "import { y } from \"./y\";\ninterface I { m(): void }\nexport function f(a: I): number {\n  return y(a);\n}\n",
+            );
             assert_eq!(r.imports, ["./y"]);
             let d = defs(&r);
             assert!(d.contains(&("I", "interface", 2, 2)), "{file}");
@@ -441,7 +459,10 @@ mod tests {
 
     #[test]
     fn go() {
-        let r = p("a.go", "package main\n\nimport (\n\t\"fmt\"\n\tx \"example.com/x\"\n)\n\ntype S struct{}\n\nfunc (s *S) M() { fmt.Println() }\n\nfunc main() {\n\tS{}.M()\n\tt.Run(\"sub\", func(t *testing.T) {})\n}\n");
+        let r = p(
+            "a.go",
+            "package main\n\nimport (\n\t\"fmt\"\n\tx \"example.com/x\"\n)\n\ntype S struct{}\n\nfunc (s *S) M() { fmt.Println() }\n\nfunc main() {\n\tS{}.M()\n\tt.Run(\"sub\", func(t *testing.T) {})\n}\n",
+        );
         assert_eq!(r.imports, ["fmt", "example.com/x"]);
         let d = defs(&r);
         assert!(d.contains(&("S", "type", 8, 8)));
@@ -461,7 +482,9 @@ mod tests {
         let types = |file: &str, src: &str| -> Vec<(String, u32, Option<String>)> {
             p(file, src).refs.into_iter().filter(|r| r.kind == "type").map(|r| (r.name, r.line, r.qual)).collect()
         };
-        let has = |t: &[(String, u32, Option<String>)], name: &str, line: u32| t.iter().any(|(n, l, _)| n == name && *l == line);
+        let has = |t: &[(String, u32, Option<String>)], name: &str, line: u32| {
+            t.iter().any(|(n, l, _)| n == name && *l == line)
+        };
 
         let r = types("a.rs", "struct S;\nfn f(s: &S) -> Vec<S> { S::new(); fs::read(); }\n");
         assert!(has(&r, "S", 2) && has(&r, "Vec", 2), "{r:?}");

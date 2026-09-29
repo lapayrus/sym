@@ -81,7 +81,11 @@ fn main() -> anyhow::Result<()> {
     let out = match cli.cmd {
         Cmd::Index => format!(
             "parsed {} unchanged {} removed {} failed {} in {:.1?}\n",
-            s.parsed, s.unchanged, s.removed, s.failed, t.elapsed()
+            s.parsed,
+            s.unchanged,
+            s.removed,
+            s.failed,
+            t.elapsed()
         ),
         Cmd::Def { name } => query::def(&conn, &name)?,
         Cmd::Refs { name, limit } => query::refs(&conn, &name, limit)?,

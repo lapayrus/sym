@@ -121,7 +121,9 @@ fn refresh(root: &Path, conn: &mut Connection, changed: &Changed) -> Result<()> 
 fn handle(root: &Path, conn: &mut Connection, changed: &Changed, line: &str) -> Option<Value> {
     let msg: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(e) => return Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": e.to_string()}})),
+        Err(e) => {
+            return Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": e.to_string()}}));
+        }
     };
     let id = msg.get("id")?.clone();
     let params = &msg["params"];
@@ -145,7 +147,8 @@ fn handle(root: &Path, conn: &mut Connection, changed: &Changed, line: &str) -> 
 }
 
 fn tools() -> Value {
-    let name = json!({"type": "string", "description": "Symbol name; `Parent.name` or `Parent::name` picks one member"});
+    let name =
+        json!({"type": "string", "description": "Symbol name; `Parent.name` or `Parent::name` picks one member"});
     let limit = json!({"type": "integer", "description": "Max hits to show"});
     json!([
         {
@@ -227,19 +230,26 @@ mod tests {
         let changed: Changed = Arc::new(Mutex::new(Some(HashSet::new())));
         let mut rpc = |s: &str| handle(&root, &mut conn, &changed, s);
 
-        let init = rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#).unwrap();
+        let init =
+            rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#).unwrap();
         assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
         assert_eq!(rpc(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#), None);
         let list = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 5);
 
         let text = |v: Value| v["result"]["content"][0]["text"].as_str().unwrap().to_string();
-        let def = rpc(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"find_def","arguments":{"name":"helper"}}}"#);
+        let def = rpc(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"find_def","arguments":{"name":"helper"}}}"#,
+        );
         assert_eq!(text(def.unwrap()), "a.rs:1-1 function fn helper()\n");
-        let calls = rpc(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"calls","arguments":{"name":"run","direction":"callees"}}}"#);
+        let calls = rpc(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"calls","arguments":{"name":"run","direction":"callees"}}}"#,
+        );
         assert!(text(calls.unwrap()).contains("helper"));
 
-        let missing = rpc(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"find_def","arguments":{}}}"#).unwrap();
+        let missing =
+            rpc(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"find_def","arguments":{}}}"#)
+                .unwrap();
         assert_eq!(missing["result"]["isError"], true);
         let unknown = rpc(r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"nope"}}"#).unwrap();
         assert_eq!(unknown["error"]["code"], -32602);

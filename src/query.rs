@@ -217,9 +217,8 @@ impl<'c> Resolver<'c> {
                 .filter(|&i| crate::lang::family(std::path::Path::new(&targets[i].path)) == family && pred(&targets[i]))
                 .collect()
         };
-        let caller_parent = || -> Result<Option<String>> {
-            Ok(enclosing(self.conn, site.file_id, site.line)?.and_then(|c| c.parent))
-        };
+        let caller_parent =
+            || -> Result<Option<String>> { Ok(enclosing(self.conn, site.file_id, site.line)?.and_then(|c| c.parent)) };
         let Some(q) = site.qual.as_deref() else {
             return Ok(pick(&|t| t.parent.is_none()));
         };
@@ -311,7 +310,8 @@ fn site_groups(conn: &Connection, query: &str, kind: Option<&str>) -> Result<Vec
         }
     }
     // A qualified query shows only the matching members; the rest only competed in resolution.
-    let keep: Vec<bool> = all.iter().map(|t| name == query || parent.is_none() || t.parent.as_deref() == parent).collect();
+    let keep: Vec<bool> =
+        all.iter().map(|t| name == query || parent.is_none() || t.parent.as_deref() == parent).collect();
     let keep = if keep.contains(&true) { keep } else { vec![true; all.len()] };
     let mut groups: Vec<(String, Vec<Site>)> =
         all.iter().zip(buckets).zip(&keep).filter(|(_, k)| **k).map(|((t, b), _)| (t.header(), b)).collect();
@@ -657,12 +657,18 @@ mod tests {
             "struct Worker;\nimpl Worker {\n    fn search_path(&self) {\n        search_path();\n    }\n    fn run(&self, searcher: Searcher) {\n        self.search_path();\n        searcher.search_path();\n        opener.open(); Vec::new();\n    }\n}\nfn search_path() {}\n",
         )
         .unwrap();
-        fs::write(root.join("src/searcher.rs"), "pub struct Searcher;\nimpl Searcher {\n    pub fn search_path(&self) {} fn new() {}\n}\n")
-            .unwrap();
+        fs::write(
+            root.join("src/searcher.rs"),
+            "pub struct Searcher;\nimpl Searcher {\n    pub fn search_path(&self) {} fn new() {}\n}\n",
+        )
+        .unwrap();
         fs::write(root.join("src/io.rs"), "pub fn open() {}\npub fn open_all() { open(); }\n").unwrap();
         fs::write(root.join("src/fs.rs"), "pub fn open() {}\n").unwrap();
-        fs::write(root.join("o.ts"), "function f(a: number): void;\nfunction f(a: string): void;\nfunction f(a: any) {\n}\nf(1);\n")
-            .unwrap();
+        fs::write(
+            root.join("o.ts"),
+            "function f(a: number): void;\nfunction f(a: string): void;\nfunction f(a: any) {\n}\nf(1);\n",
+        )
+        .unwrap();
         let mut conn = db::open(&root).unwrap();
         index::index(&root, &mut conn, None).unwrap();
 
