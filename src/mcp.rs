@@ -19,6 +19,13 @@ use crate::{db, index, lang, query};
 /// Repo-relative paths changed since the last refresh; `None` = watcher lost track, rescan everything.
 type Changed = Arc<Mutex<Option<HashSet<String>>>>;
 
+/// Sent in `initialize`; clients show it to the model as guidance for when to use these tools.
+const INSTRUCTIONS: &str = "sym is a symbol index of this repo (Rust, Python, JS/TS, Go), kept up to date with the \
+files on disk. Prefer it over grep and over reading whole files to find where a symbol is defined (find_def), \
+where it is used (find_refs), who calls a function or what it calls (calls), a symbol from part of its name \
+(search), and what a file contains (outline). Results give `path:line-end` spans: read just those lines. \
+Use grep for text that isn't a symbol (strings, comments, config).";
+
 /// Quiet time before the background thread re-indexes, so a burst (save, `git checkout`) is one update.
 const SETTLE: Duration = Duration::from_millis(20);
 
@@ -124,6 +131,7 @@ fn handle(root: &Path, conn: &mut Connection, changed: &Changed, line: &str) -> 
             "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "sym", "version": env!("CARGO_PKG_VERSION")},
+            "instructions": INSTRUCTIONS,
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),

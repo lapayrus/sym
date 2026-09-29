@@ -1,7 +1,7 @@
 //! Read-side queries. Each returns ready-to-print, line-oriented text grouped by file,
 //! shared by the CLI and (phase 4) the MCP server.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use anyhow::Result;
@@ -354,14 +354,17 @@ const UNRESOLVED: &str = "(unresolved: external, or no matching definition index
 pub fn refs(conn: &Connection, query: &str, limit: usize) -> Result<String> {
     let mut out = String::new();
     let (mut shown, mut total) = (0, 0);
+    let mut hidden = HashSet::new();
     for (header, sites) in site_groups(conn, query, None)? {
         total += sites.len();
-        if sites.is_empty() || shown >= limit {
+        let take = limit.saturating_sub(shown).min(sites.len());
+        hidden.extend(sites[take..].iter().map(|s| s.path.clone()));
+        if take == 0 {
             continue;
         }
         writeln!(out, "{header}")?;
         let mut last = String::new();
-        for s in sites.iter().take(limit - shown) {
+        for s in &sites[..take] {
             if s.path != last {
                 writeln!(out, "  {}", s.path)?;
                 last.clone_from(&s.path);
@@ -376,9 +379,15 @@ pub fn refs(conn: &Connection, query: &str, limit: usize) -> Result<String> {
     if total == 0 {
         writeln!(out, "no references to `{query}`")?;
     } else if total > shown {
-        writeln!(out, "... {} more", total - shown)?;
+        writeln!(out, "{}", more(total - shown, "", hidden.len()))?;
     }
     Ok(out)
+}
+
+/// `... 20 more in 4 files (raise limit to see all)`: so an agent knows what it isn't seeing.
+fn more(n: usize, what: &str, files: usize) -> String {
+    let s = if files == 1 { "" } else { "s" };
+    format!("... {n} more{what} in {files} file{s} (raise limit to see all)")
 }
 
 /// Word initials of an identifier, lowercased: `getTypeOfSymbol` / `get_type_of_symbol` → `gtos`.
@@ -428,15 +437,18 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<String> {
 pub fn callers(conn: &Connection, query: &str, limit: usize) -> Result<String> {
     let mut out = String::new();
     let (mut shown, mut total) = (0, 0);
+    let mut hidden = HashSet::new();
     for (header, sites) in site_groups(conn, query, Some("call"))? {
         total += sites.len();
-        if sites.is_empty() || shown >= limit {
+        let take = limit.saturating_sub(shown).min(sites.len());
+        hidden.extend(sites[take..].iter().map(|s| s.path.clone()));
+        if take == 0 {
             continue;
         }
         writeln!(out, "{header}")?;
         // (path, caller name, caller line, call lines); a caller's calls are contiguous.
         let mut lines: Vec<(&str, Option<Caller>, Vec<String>)> = Vec::new();
-        for s in sites.iter().take(limit - shown) {
+        for s in &sites[..take] {
             let caller = enclosing(conn, s.file_id, s.line)?;
             let at = s.line.to_string();
             match lines.last_mut() {
@@ -457,7 +469,7 @@ pub fn callers(conn: &Connection, query: &str, limit: usize) -> Result<String> {
     if total == 0 {
         writeln!(out, "no calls to `{query}`")?;
     } else if total > shown {
-        writeln!(out, "... {} more call sites", total - shown)?;
+        writeln!(out, "{}", more(total - shown, " call sites", hidden.len()))?;
     }
     Ok(out)
 }
@@ -573,7 +585,7 @@ mod tests {
 
         assert_eq!(
             refs(&conn, "helper", 2).unwrap(),
-            "src/a.rs:1-1 function fn helper()\n  src/a.rs\n    3 call in run\n    4 call in run\n... 3 more\n"
+            "src/a.rs:1-1 function fn helper()\n  src/a.rs\n    3 call in run\n    4 call in run\n... 3 more in 2 files (raise limit to see all)\n"
         );
 
         assert_eq!(
@@ -593,7 +605,7 @@ mod tests {
         );
         assert_eq!(
             callers(&conn, "helper", 1).unwrap(),
-            "src/a.rs:1-1 function fn helper()\n  src/a.rs:2 run (3)\n... 4 more call sites\n"
+            "src/a.rs:1-1 function fn helper()\n  src/a.rs:2 run (3)\n... 4 more call sites in 2 files (raise limit to see all)\n"
         );
         assert_eq!(
             callees(&conn, "go", 50).unwrap(),

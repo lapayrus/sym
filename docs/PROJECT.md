@@ -47,7 +47,7 @@ query latency, and tokens per task versus `rg`.
 | Query compile | per-language `OnceLock`, compiled on first use | startup cost only for languages present | — |
 | File filter | `.gitignore` respected even outside git (`require_git(false)`); ignore files above a repo root skipped (`parents(false)` when root has `.git`); hard cap 16 MiB | real sources reach 3 MiB; parent lookup cost 50 ms/refresh on TypeScript | — |
 | Minified code | every file is parsed; symbols whose name starts past column 1000 are dropped | no whole-file heuristic to misfire (a normal file with one huge data line keeps its symbols) | the ≤ 1000-column junk from a bundle's first line bothers anyone |
-| MCP transport | hand-rolled sync stdio JSON-RPC (`mcp.rs`, newline-delimited, `serde_json` only); `initialize` echoes the client's protocol version; tool failures return `isError` content, unknown tools/methods return JSON-RPC errors | about 100 lines, no tokio, no `rmcp` | HTTP transport or concurrent requests needed → `rmcp`; a client needs a newer protocol feature → pin versions |
+| MCP transport | hand-rolled sync stdio JSON-RPC (`mcp.rs`, newline-delimited, `serde_json` only); `initialize` echoes the client's protocol version and sends `instructions` (when to prefer sym over grep/reading files); tool failures return `isError` content, unknown tools/methods return JSON-RPC errors | about 100 lines, no tokio, no `rmcp` | HTTP transport or concurrent requests needed → `rmcp`; a client needs a newer protocol feature → pin versions |
 | Fuzzy search | SQL `LIKE '%a%b%'` prefilter (case-insensitive subsequence, `_`/`%` escaped) over distinct non-callback names, then ranked: exact word initials (`gtos` → `getTypeOfSymbol`) → `nucleo-matcher` score → shorter | boundary/camelCase-aware ranking, 24–59 ms at 31k files | too slow → in-memory name list in `serve` |
 | Rejected: Laya (Convai decision model) | not used | a probabilistic classifier, ~140 ms+/call on CPU, 1.7 GB, 512-token context; conflicts with the "fast, exact, light" pitch | — |
 
@@ -68,8 +68,8 @@ Post-V1, before the public GitHub release:
 | # | Phase | Done when | Status |
 |---|---|---|---|
 | 7 | Type-usage references | `refs Searcher` (Rust) lists `&mut Searcher` / `Searcher::new()` sites | ✅ done |
-| 8 | Dogfood `sym serve` in Claude Code, tune tool descriptions | a real Claude Code session uses the tools correctly | ⏳ next |
-| 9 | Release: versioning, CI, prebuilt binaries, CONTRIBUTING | tag push builds binaries for Linux/macOS/Windows | ⏳ |
+| 8 | Dogfood `sym serve` in Claude Code, tune tool descriptions | a real Claude Code session uses the tools correctly | ✅ done (headless `claude -p`, see Changelog) |
+| 9 | Release: versioning, CI, prebuilt binaries, CONTRIBUTING | tag push builds binaries for Linux/macOS/Windows | ⏳ next |
 
 MCP tools: `find_def(name)`, `find_refs(name, limit?)`, `search(query, limit?)`,
 `calls(name, direction? = callers|callees, limit?)`, `outline(path)`.
@@ -155,6 +155,7 @@ Known limits (also marked `ponytail:` in the code):
 
 ## Changelog
 
+- 2026-09-29: Phase 8 done. Ran `sym serve` in headless Claude Code (`claude -p --mcp-config .. --strict-mcp-config`) on ripgrep. Told to use sym: 3/3 correct in 5 turns. Not told, with Read/Grep/Glob also allowed: it picked sym by itself. Fixes from the first run: truncation now says `... N more in M files (raise limit to see all)` (the model had guessed a file count from a truncated list; with the hint it re-queried with `limit` and got it right), and `initialize` sends server `instructions`.
 - 2026-09-29: Phase 7 done: type-usage references (schema v3, indexes rebuild on upgrade). ripgrep `refs Searcher`: none → 83 lines over 12 files; refs rows +50% on ripgrep, DB +14% on TypeScript. Added post-V1 phases 7–9 to the roadmap. Note: this machine indexed TypeScript in 18–28 s today with old and new binaries alike (6.9 s yesterday), so compare timings only within one session.
 - 2026-09-28: V1 complete (roadmap phases 0–6). Further work goes in "Next candidates" under Roadmap.
 - 2026-09-28: Phase 6 done. `bench/bench.py` + `README.md` with numbers vs rg 14.1.1 on ripgrep and TypeScript (serve queries 0.1–19 ms vs rg 2.3 s at 31k files; outlines 6–16× fewer tokens, refs up to 8.7×). Benchmark found ambiguous sites repeated under every candidate (491 lines for `refs search_reader`): now listed once under `? one of a:1, b:2 +N` (148 lines). Documented the type-usage refs gap.
