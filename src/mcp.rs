@@ -65,7 +65,9 @@ pub fn serve(root: &Path) -> Result<()> {
 
 /// Record OS file events in `changed` and poke `wake` when something was recorded.
 fn watch(root: &Path, changed: Changed, wake: Sender<()>) -> Result<notify::RecommendedWatcher> {
-    let base = root.to_path_buf();
+    // Events come as the watched path joined with the file (Windows, inotify) or fully resolved
+    // (macOS FSEvents: `/var/..` arrives as `/private/var/..`), so match against both forms.
+    let bases = [root.to_path_buf(), root.canonicalize().unwrap_or_else(|_| root.to_path_buf())];
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let mut c = changed.lock().unwrap();
         let ev = match res {
@@ -80,7 +82,7 @@ fn watch(root: &Path, changed: Changed, wake: Sender<()>) -> Result<notify::Reco
             return; // our own reads
         }
         for p in &ev.paths {
-            let Some(rel) = index::rel(&base, p) else { continue };
+            let Some(rel) = bases.iter().find_map(|b| index::rel(b, p)) else { continue };
             if matches!(rel.split('/').next(), Some(".sym" | ".git")) {
                 continue; // our own db writes, git internals
             }
