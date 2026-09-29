@@ -6,8 +6,9 @@ use rusqlite::{Connection, Transaction, params};
 
 use crate::lang::Parsed;
 
-/// Bump on any schema change: an index with another version is dropped and rebuilt.
-const VERSION: i32 = 2;
+/// Bump on any schema or extraction change: an index with another version is dropped and rebuilt.
+/// 3: type-usage references.
+const VERSION: i32 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE files(

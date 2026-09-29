@@ -73,6 +73,16 @@ fn merge_overloads(mut t: Vec<Target>) -> Vec<Target> {
     t
 }
 
+/// Definitions a reference to `name` can point at: Rust `impl X` blocks are left out (a use of
+/// `X` means the type, and the widest-wins merge would otherwise pick the impl), then overloads merged.
+fn ref_targets(conn: &Connection, name: &str) -> Result<Vec<Target>> {
+    let mut t = targets(conn, name, None, 1000)?;
+    if t.iter().any(|t| t.kind != "impl") {
+        t.retain(|t| t.kind != "impl");
+    }
+    Ok(merge_overloads(t))
+}
+
 /// Definitions for a user query: `name` or `Parent.name`; a qualifier that matches nothing is
 /// retried as a whole name (callback names contain dots) and then ignored.
 fn lookup(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Target>> {
@@ -271,11 +281,11 @@ fn locations(at: Vec<String>) -> String {
 /// site listed once), then the unresolved ones.
 fn site_groups(conn: &Connection, query: &str, kind: Option<&str>) -> Result<Vec<(String, Vec<Site>)>> {
     let (parent, name) = split_qualified(query);
-    let mut all = merge_overloads(targets(conn, name, None, 1000)?);
+    let mut all = ref_targets(conn, name)?;
     let mut name = name;
     if all.is_empty() && parent.is_some() {
         name = query; // a callback name containing dots
-        all = merge_overloads(targets(conn, name, None, 1000)?);
+        all = ref_targets(conn, name)?;
     }
     let mut stmt = conn.prepare_cached(
         "SELECT r.file_id, f.path, r.line, r.kind, r.qual FROM refs r JOIN files f ON f.id = r.file_id
@@ -472,7 +482,7 @@ pub fn callees(conn: &Connection, query: &str, limit: usize) -> Result<String> {
         let (mut lines, mut external): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
         for (name, qual, line) in sites {
             let site = Site { file_id: d.file_id, path: d.path.clone(), line, kind: "call".into(), qual };
-            let cands = merge_overloads(targets(conn, &name, None, 50)?);
+            let cands = ref_targets(conn, &name)?;
             let hits = if cands.is_empty() { Vec::new() } else { res.resolve(&site, &cands)? };
             let at = |i: &usize| format!("{}:{}", cands[*i].path, cands[*i].line);
             let entry = match hits.as_slice() {

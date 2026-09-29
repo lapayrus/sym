@@ -23,10 +23,15 @@ const RUST_EXTRA: &str = r#"
   (generic_type type: (type_identifier) @name)
   (scoped_type_identifier name: (type_identifier) @name)
 ]) @definition.impl
+(type_identifier) @name @reference.type
+((scoped_identifier path: (identifier) @name) @reference.type (#match? @name "^[A-Z]"))
 "#;
 const PYTHON_EXTRA: &str = r#"
 (import_statement name: [(dotted_name) @name (aliased_import name: (dotted_name) @name)]) @reference.import
 (import_from_statement module_name: (_) @name) @reference.import
+(type (identifier) @name) @reference.type
+(generic_type (identifier) @name) @reference.type
+(class_definition superclasses: (argument_list (identifier) @name)) @reference.type
 "#;
 const JS_EXTRA: &str = r#"
 (import_statement source: (string (string_fragment) @name)) @reference.import
@@ -34,6 +39,13 @@ const JS_EXTRA: &str = r#"
 ((call_expression function: (identifier) arguments: (arguments . (string (string_fragment) @name))) @reference.import
   (#match? @reference.import "^require\\s*\\("))
 (call_expression arguments: (arguments . (string (string_fragment) @name) [(arrow_function) (function_expression)])) @definition.callback
+"#;
+const JS_ONLY: &str = r#"
+(class_heritage (identifier) @name) @reference.type
+"#;
+const TS_EXTRA: &str = r#"
+(type_identifier) @name @reference.type
+(extends_clause value: (identifier) @name) @reference.type
 "#;
 const GO_EXTRA: &str = r#"
 (import_spec path: (_) @name) @reference.import
@@ -95,10 +107,10 @@ const fn lang(
 static LANGS: [Lang; 6] = [
     lang(&["rs"], || tree_sitter_rust::LANGUAGE.into(), &[tree_sitter_rust::TAGS_QUERY, RUST_EXTRA]),
     lang(&["py", "pyi"], || tree_sitter_python::LANGUAGE.into(), &[tree_sitter_python::TAGS_QUERY, PYTHON_EXTRA]),
-    lang(&["js", "mjs", "cjs", "jsx"], || js::LANGUAGE.into(), &[js::TAGS_QUERY, JS_EXTRA]),
+    lang(&["js", "mjs", "cjs", "jsx"], || js::LANGUAGE.into(), &[js::TAGS_QUERY, JS_EXTRA, JS_ONLY]),
     // TS tags.scm only holds TS-specific patterns; the JS ones apply on top.
-    lang(&["ts", "mts", "cts"], || ts::LANGUAGE_TYPESCRIPT.into(), &[js::TAGS_QUERY, ts::TAGS_QUERY, JS_EXTRA]),
-    lang(&["tsx"], || ts::LANGUAGE_TSX.into(), &[js::TAGS_QUERY, ts::TAGS_QUERY, JS_EXTRA]),
+    lang(&["ts", "mts", "cts"], || ts::LANGUAGE_TYPESCRIPT.into(), &[js::TAGS_QUERY, ts::TAGS_QUERY, JS_EXTRA, TS_EXTRA]),
+    lang(&["tsx"], || ts::LANGUAGE_TSX.into(), &[js::TAGS_QUERY, ts::TAGS_QUERY, JS_EXTRA, TS_EXTRA]),
     lang(&["go"], || tree_sitter_go::LANGUAGE.into(), &[tree_sitter_go::TAGS_QUERY, GO_EXTRA]),
 ];
 
@@ -215,7 +227,8 @@ fn scan_header(def: Node, python: bool) -> (usize, Vec<Range<usize>>) {
 /// Receiver/qualifier of the reference named by `name` (see [`Ref::qual`]).
 fn qualifier(name: Node, src: &[u8]) -> Option<String> {
     let p = name.parent()?;
-    let q = ["object", "value", "operand", "path"].into_iter().find_map(|f| p.child_by_field_name(f))?;
+    // `package`: Go `ast.Symbol`; `module`: TS `ns.Type`.
+    let q = ["object", "value", "operand", "path", "package", "module"].into_iter().find_map(|f| p.child_by_field_name(f))?;
     if q.id() == name.id() {
         return None;
     }
@@ -441,6 +454,25 @@ mod tests {
         assert_eq!(sig(&r, "S"), "type S struct");
         assert_eq!(sig(&r, "sub"), "t.Run(\"sub\")");
         assert_eq!(parent(&r, "M"), Some("S"));
+    }
+
+    #[test]
+    fn type_refs() {
+        let types = |file: &str, src: &str| -> Vec<(String, u32, Option<String>)> {
+            p(file, src).refs.into_iter().filter(|r| r.kind == "type").map(|r| (r.name, r.line, r.qual)).collect()
+        };
+        let has = |t: &[(String, u32, Option<String>)], name: &str, line: u32| t.iter().any(|(n, l, _)| n == name && *l == line);
+
+        let r = types("a.rs", "struct S;\nfn f(s: &S) -> Vec<S> { S::new(); fs::read(); }\n");
+        assert!(has(&r, "S", 2) && has(&r, "Vec", 2), "{r:?}");
+        assert!(!has(&r, "S", 1) && !r.iter().any(|(n, ..)| n == "fs"), "def isn't a ref; lowercase paths are modules");
+        let r = types("a.py", "class A(Base):\n    pass\ndef f(x: A) -> list[A]:\n    pass\n");
+        assert!(has(&r, "Base", 1) && has(&r, "A", 3), "{r:?}");
+        let r = types("a.ts", "class A extends B implements I {}\nfunction f(x: Map<string, A>): A { return x; }\n");
+        assert!(has(&r, "B", 1) && has(&r, "I", 1) && has(&r, "Map", 2) && has(&r, "A", 2), "{r:?}");
+        assert!(has(&types("a.js", "class A extends B {}\n"), "B", 1));
+        let r = types("a.go", "package p\nfunc f(x ast.Symbol) T { return T{} }\n");
+        assert!(r.contains(&("Symbol".into(), 2, Some("ast".into()))) && has(&r, "T", 2), "{r:?}");
     }
 
     #[test]

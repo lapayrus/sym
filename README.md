@@ -135,8 +135,8 @@ The caller of a reference is the innermost definition whose line span contains i
 
 - Resolution is syntactic, not type-based. `x.run()` with several `run` methods and an uninformative
   receiver name ends up in a `? one of ...` group.
-- Type usages are only partly indexed as references. In Rust, `refs Searcher` finds no `&mut Searcher` and no
-  `Searcher::new()`. Calls, `new X`, and the type positions the TS/Go grammars capture are covered.
+- References are calls, `new X`, and type usages (annotations, generics, `extends`, `Type::` paths).
+  Generic parameters and builtin types (`T`, `Vec`, `list`) are recorded but resolve to nothing.
 - Editing a very large file (MBs) takes about 0.5–1 s to re-index. `sym serve` does that in the background.
 - Anonymous callbacks without a name string, such as `arr.map(x => ..)` at top level, have no enclosing definition.
 

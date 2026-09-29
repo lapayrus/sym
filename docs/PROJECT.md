@@ -27,6 +27,7 @@ query latency, and tokens per task versus `rg`.
 | Parsing | `tree-sitter` 0.27 `Query`/`QueryCursor` running each grammar's `tags.scm` + our extras; `tree-sitter-tags` dropped | same queries, but we keep the syntax tree: syntax-aware signatures, parents, qualifiers, and (if ever needed) incremental re-parse. One tag per name node: defs beat refs, then earliest pattern | — |
 | Languages | Rust, Python, JS/JSX, TS/TSX, Go | cover most agent workloads | users ask for more (add grammar + extra query in `lang.rs`) |
 | Imports | extra `@reference.import` patterns inside the tags query | same single parse, no second pass | — |
+| Type references | `@reference.type` extras: every `type_identifier` (Rust, TS; Go's tags.scm already has it), capitalized Rust `Type::` paths, JS/TS `extends`, Python annotations + base classes. Qualifier also read from `package` (Go `ast.T`) / `module` (TS `ns.T`) fields. Rust `impl X` defs are not ref targets | `refs Searcher` finds its uses; +14% DB (66 → 75 MB on TypeScript), index time unchanged within noise; `calls`/`callees` still use `call` refs only | row count hurts → skip generic params/builtins |
 | Signatures | def text up to its `body` field (or the body of the function in its `value`/`right`); body-less defs scan tokens to a top-level `{`/`;` (Python `:`) or past `=>`. Strings/comments are atomic, strings > 40 B print as `"..."`; 200 chars max | syntax-aware, no per-language code | a grammar with no `body` field gives odd headers |
 | Callback defs | `f("name", () => ..)` (JS/TS) and `t.Run("name", func..)` (Go) are `callback` defs named by the string | calls in test blocks/handlers get an enclosing def; outline shows the test tree | too noisy → restrict to known test/route callee names |
 | Rust impls | `impl X` / `impl T for X` are `impl` defs named `X` | methods get a parent, outline nests them | — |
@@ -62,8 +63,13 @@ query latency, and tokens per task versus `rg`.
 | 5 | Watch mode (`notify` + background re-index thread inside `serve`) | an edit shows up in queries in < 100 ms | ✅ done (9–19 ms write → answer on TypeScript) |
 | 6 | Benchmarks + README | published numbers vs `rg` | ✅ done (`bench/bench.py`, README tables for ripgrep + TypeScript) |
 
-Next candidates (not scheduled): type-usage refs (`@reference.type` per language), run `sym serve` inside Claude Code
-and tune tool descriptions, publish binaries.
+Post-V1, before the public GitHub release:
+
+| # | Phase | Done when | Status |
+|---|---|---|---|
+| 7 | Type-usage references | `refs Searcher` (Rust) lists `&mut Searcher` / `Searcher::new()` sites | ✅ done |
+| 8 | Dogfood `sym serve` in Claude Code, tune tool descriptions | a real Claude Code session uses the tools correctly | ⏳ next |
+| 9 | Release: versioning, CI, prebuilt binaries, CONTRIBUTING | tag push builds binaries for Linux/macOS/Windows | ⏳ |
 
 MCP tools: `find_def(name)`, `find_refs(name, limit?)`, `search(query, limit?)`,
 `calls(name, direction? = callers|callees, limit?)`, `outline(path)`.
@@ -131,10 +137,8 @@ newly written files. Benchmarks must use a warm cache, and should report the col
 Known limits (also marked `ponytail:` in the code):
 - Resolution is syntactic, not type-based: `x.run()` with several project `run` methods and an
   uninformative receiver name lands in a `? one of ...` group.
-- Type usages are only partly references: refs are calls (all languages), `new X` (JS/TS), the type positions the
-  TS/Go `tags.scm` capture, and `impl Trait for` (Rust). So in Rust `refs Searcher` finds no `&mut Searcher`
-  annotations and no `Searcher::new()` (stored as a call to `new` with qualifier `Searcher`). Fix: extra
-  `@reference.type` patterns per language (more rows).
+- Type references are syntactic too: generic parameters (`T`) and builtins (`Vec`, `list`, `Map`) get rows that
+  resolve to nothing (they land in "unresolved"); a lowercase Rust path (`fs::read`) is taken as a module, not a type.
 - Minified files: symbols in the first 1000 columns of a minified line still get indexed (bounded junk).
 - Huge files re-index whole: a 1.4 MiB edit costs ~650 ms (1.1 s for 3 MiB `checker.ts`). `serve` hides it in the
   background, so only a query sent within that window waits; the CLI always pays it. Incremental re-parse with a
@@ -151,6 +155,7 @@ Known limits (also marked `ponytail:` in the code):
 
 ## Changelog
 
+- 2026-09-29: Phase 7 done: type-usage references (schema v3, indexes rebuild on upgrade). ripgrep `refs Searcher`: none → 83 lines over 12 files; refs rows +50% on ripgrep, DB +14% on TypeScript. Added post-V1 phases 7–9 to the roadmap. Note: this machine indexed TypeScript in 18–28 s today with old and new binaries alike (6.9 s yesterday), so compare timings only within one session.
 - 2026-09-28: V1 complete (roadmap phases 0–6). Further work goes in "Next candidates" under Roadmap.
 - 2026-09-28: Phase 6 done. `bench/bench.py` + `README.md` with numbers vs rg 14.1.1 on ripgrep and TypeScript (serve queries 0.1–19 ms vs rg 2.3 s at 31k files; outlines 6–16× fewer tokens, refs up to 8.7×). Benchmark found ambiguous sites repeated under every candidate (491 lines for `refs search_reader`): now listed once under `? one of a:1, b:2 +N` (148 lines). Documented the type-usage refs gap.
 - 2026-09-28: Watch-mode limits fixed before phase 6. Background re-index thread (20 ms settle, conn behind a mutex) so edit cost is paid before the next tool call: 1.4 MiB edit answered in 0 ms after 1 s (was ~650 ms on the call). Scoped updates look up stamps per changed path (`db::known_under`) instead of loading all: small edit → answer 38–42 → 9–19 ms. Measured big-file breakdown; incremental re-parse deferred (saves ≤ 1/3).
